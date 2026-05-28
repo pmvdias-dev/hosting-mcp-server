@@ -1,0 +1,7 @@
+node_modules/
+sessions/
+.env
+mcp-server.log
+*.log
+*.png
+.claude/
