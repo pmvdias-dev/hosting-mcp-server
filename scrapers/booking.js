@@ -113,6 +113,85 @@ function _bookingSerialize(fn) {
   return next;
 }
 
+// ─── Auto session refresh ────────────────────────────────────────────────
+// When any scraper call throws "Session expired", automatically trigger the
+// login-browser flow (saveBookingSession) and retry the original call once.
+// If refresh also fails, propagate a clearer combined error.
+async function _autoRefreshOnExpiry(fn) {
+  const stderrLog = (msg, extra) => {
+    const line = JSON.stringify({ ts: new Date().toISOString(), source: 'auto-refresh', msg, ...(extra || {}) });
+    process.stderr.write(line + '\n');
+    try {
+      fs.appendFileSync(
+        join(__dirname, '..', 'mcp-server.log'),
+        JSON.stringify({ ts: new Date().toISOString(), level: 'debug', tool: 'auto-refresh', message: msg + (extra ? ' ' + JSON.stringify(extra) : '') }) + '\n'
+      );
+    } catch { /* ignore */ }
+  };
+  stderrLog('wrapper entered');
+  try {
+    const result = await fn();
+    stderrLog('inner fn returned normally');
+    return result;
+  } catch (err) {
+    const msg = String(err?.message || err);
+    stderrLog('caught error', { msgHead: msg.slice(0, 200), matchesExpired: /session expired/i.test(msg) });
+    if (!/session expired/i.test(msg)) throw err;
+    stderrLog('session expired detected — opening browser for re-login');
+    // Give the closed browser context a beat before we launch a new one for save-session
+    await new Promise((r) => setTimeout(r, 500));
+    let refreshResult;
+    try {
+      const mod = await import('../save-session.js');
+      refreshResult = await mod.saveBookingSession();
+    } catch (refreshErr) {
+      const rmsg = refreshErr?.message ?? String(refreshErr);
+      stderrLog('refresh threw', { msg: rmsg });
+      throw new Error(
+        `Session was expired and auto-refresh failed: ${rmsg}. ` +
+        `Try running "node save-session.js booking" manually.`
+      );
+    }
+    stderrLog('session refresh completed', { success: !!refreshResult?.success });
+    if (!refreshResult?.success) {
+      // User closed the browser without logging in — no point retrying.
+      throw new Error(
+        `Session refresh was cancelled (browser closed before login completed). ` +
+        `Please re-run the tool to re-open the login browser.`
+      );
+    }
+    // Booking's persistent profile has just been written to disk by
+    // saveBookingSession. Launching a new Playwright context immediately after
+    // sometimes races the lockfile release, and even when the launch succeeds
+    // the cookies aren't fully warmed on first request — the extranet redirects
+    // through /login → /admin, and the scraper sees an empty reservations list
+    // instead of the real data. Give the profile a beat, then retry up to twice
+    // with a growing pause; if either attempt returns without a session-expired
+    // error, we take that result.
+    const RETRY_WAITS_MS = [2000, 3500];
+    let lastRetryErr = null;
+    for (let i = 0; i < RETRY_WAITS_MS.length; i++) {
+      await new Promise((r) => setTimeout(r, RETRY_WAITS_MS[i]));
+      stderrLog('post-refresh retry attempt', { attempt: i + 1, waitedMs: RETRY_WAITS_MS[i] });
+      try {
+        const result = await fn();
+        stderrLog('post-refresh retry succeeded', { attempt: i + 1 });
+        return result;
+      } catch (retryErr) {
+        lastRetryErr = retryErr;
+        const rmsg = String(retryErr?.message || retryErr);
+        stderrLog('post-refresh retry failed', { attempt: i + 1, msgHead: rmsg.slice(0, 200) });
+        // If it's not a session issue, bail — no point re-hitting for a real error.
+        if (!/session expired/i.test(rmsg)) throw retryErr;
+      }
+    }
+    throw new Error(
+      `Session was refreshed but reservations still failed after two retries: ` +
+      `${lastRetryErr?.message ?? lastRetryErr}. Try re-running the tool.`
+    );
+  }
+}
+
 function wrapAddCookies(context) {
   const _real = context.addCookies.bind(context);
   context.addCookies = async (arg) => {
@@ -159,7 +238,7 @@ async function getBrowserContext() {
   bookingLog('getBrowserContext', { profileExists, sessionExists });
 
   if (!profileExists && !sessionExists) {
-    throw new Error('No Booking.com session found — run: node save-session.js booking');
+    throw new Error('No Booking.com session found — run: node save-session.js booking (or call the refresh_booking_session MCP tool)');
   }
 
   const userAgent = getPinnedUserAgent();
@@ -189,7 +268,7 @@ async function getBrowserContext() {
 
   if (!cookiesOk) {
     throw new Error(
-      'booking-session.json cookies is not an array — run: node save-session.js booking'
+      'booking-session.json cookies is not an array — run: node save-session.js booking (or call the refresh_booking_session MCP tool)'
     );
   }
 
@@ -314,10 +393,19 @@ function isLoginUrl(url) {
   );
 }
 
+function normalizeStatus(raw) {
+  const s = (raw ?? '').toLowerCase();
+  if (/cancel/i.test(s))              return 'cancelled';
+  if (/no[\s_-]?show/i.test(s))       return 'no_show';
+  if (/pending|waiting|process/i.test(s)) return 'pending';
+  if (/ok|confirm|valid|booking\.com|guaranteed|paid/i.test(s)) return 'confirmed';
+  return raw.trim() || null;
+}
+
 function assertNotLoginPage(url) {
   bookingLog('assertNotLoginPage check', { url });
   if (isLoginUrl(url)) {
-    throw new Error(`Session expired (landed on: ${url}) — run: node save-session.js booking`);
+    throw new Error(`Session expired (landed on: ${url}) — run: node save-session.js booking (or call the refresh_booking_session MCP tool)`);
   }
 }
 
@@ -357,6 +445,15 @@ async function interceptApiResponse(page, urlPattern, timeout = 20_000) {
 
 function today() {
   const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+// One week before today, in YYYY-MM-DD. Used as the default startDate so
+// currently-in-house guests (who checked in a few days ago and haven't checked
+// out yet) still appear — Booking's default arrival-date filter otherwise
+// excludes them the moment their check-in day passes.
+function oneWeekAgo() {
+  const d = new Date();
+  d.setDate(d.getDate() - 7);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
@@ -870,13 +967,13 @@ async function applyDateFilterByCalendar(page, input, startDate, endDate) {
 }
 
 export async function getBookingReservations(args = {}) {
-  return _bookingSerialize(() => _getBookingReservations(args));
+  return _bookingSerialize(() => _autoRefreshOnExpiry(() => _getBookingReservations(args)));
 }
-async function _getBookingReservations({ startDate, endDate } = {}) {
+async function _getBookingReservations({ startDate, endDate, useSearchUrl = false } = {}) {
   const start = startDate || today();
   const end   = endDate   || oneYearFromNow();
   resetDiag();
-  bookingLog('getBookingReservations', { start, end });
+  bookingLog('getBookingReservations', { start, end, useSearchUrl });
 
   let ctx;
   try {
@@ -893,72 +990,194 @@ async function _getBookingReservations({ startDate, endDate } = {}) {
     bookingLog('after warm-up nav', { url: page.url() });
 
     if (isLoginUrl(page.url())) {
-      throw new Error(`Session expired at warm-up (landed on: ${page.url()}) — run: node save-session.js booking`);
+      throw new Error(`Session expired at warm-up (landed on: ${page.url()}) — run: node save-session.js booking (or call the refresh_booking_session MCP tool)`);
     }
 
     await randomDelay(2_000, 4_000);
     await selectPropertyIfNeeded(page);
 
-    // ── Navigate to Reservations page ────────────────────────────────────────
-    const reservationsLinkSelectors = [
-      'nav a[href*="/groups/reservations/"]',
-      'a[href*="/groups/reservations/"]:visible',
-      'header a:has-text("Reservations")',
-      'nav a:has-text("Reservations")',
-      'a[data-test-id*="reservations"]',
-      'a:has-text("Reservations")',
-    ];
+    // Extract current hotel_id — needed when we build the direct search URL
+    // (search_reservations.html requires it in the query string).
+    let hotelId = null;
+    try { hotelId = new URL(page.url()).searchParams.get('hotel_id'); } catch {}
+    if (!hotelId) hotelId = getPropertyConfig().hotelId;
 
-    let clickedNav = false;
-    for (const sel of reservationsLinkSelectors) {
-      try {
-        await page.click(sel, { timeout: 3_000 });
-        bookingLog('clicked Reservations menu link', { sel });
-        clickedNav = true;
-        break;
-      } catch {}
+    let apiPromise;
+
+    if (useSearchUrl) {
+      // ── Direct nav to search_reservations.html with date+status filters ───
+      const searchUrl = new URL('https://admin.booking.com/hotel/hoteladmin/extranet_ng/manage/search_reservations.html');
+      searchUrl.searchParams.set('upcoming_reservations', '1');
+      searchUrl.searchParams.set('source', 'nav');
+      searchUrl.searchParams.set('lang', 'en');
+      if (hotelId) searchUrl.searchParams.set('hotel_id', hotelId);
+      searchUrl.searchParams.set('reservation_status', 'ok');
+      searchUrl.searchParams.set('date_from', start);
+      searchUrl.searchParams.set('date_to', end);
+      searchUrl.searchParams.set('date_type', 'arrival');
+      const finalSearchUrl = withSesParam(page.url(), searchUrl.toString());
+      bookingLog('search_reservations: navigating', { url: finalSearchUrl });
+
+      // Collect ALL JSON API responses that fire during navigation so we can
+      // pick out the one that actually contains reservations (Booking's page
+      // fires several XHRs — saved-searches, filters, then reservations).
+      const _allApiResponses = [];
+      const _apiCollector = async (response) => {
+        try {
+          const url = response.url();
+          if (!/admin\.booking\.com|fresa|extranet/i.test(url)) return;
+          const ct = response.headers()['content-type'] ?? '';
+          if (!ct.includes('json')) return;
+          if (!response.ok()) return;
+          const json = await response.json().catch(() => null);
+          if (json) _allApiResponses.push({ url, json });
+        } catch { /* ignore */ }
+      };
+      page.on('response', _apiCollector);
+
+      await page.goto(finalSearchUrl, { waitUntil: 'domcontentloaded' });
+      await page.waitForLoadState('networkidle', { timeout: 15_000 }).catch(() => {});
+      // Extra settling time — some Booking data loads after networkidle
+      await page.waitForTimeout(3_000);
+      bookingLog('search_reservations: loaded', { url: page.url() });
+      assertNotLoginPage(page.url());
+
+      // Detach collector, then log every intercepted URL + array structure
+      page.off('response', _apiCollector);
+      bookingLog('search_reservations: intercepted API count', { count: _allApiResponses.length });
+
+      // Special: log the raw payload of any `list_request` / reservations URLs
+      // — those are the primary suspects for containing the reservation data.
+      for (const r of _allApiResponses) {
+        if (/list_request|reservations\/list|search_reservations|extranet\/reservations/i.test(r.url)) {
+          const raw = JSON.stringify(r.json).slice(0, 1500);
+          bookingLog('search_reservations: candidate raw', { url: r.url.slice(0, 150), payload: raw });
+        }
+      }
+      let chosen = null;
+      for (const r of _allApiResponses) {
+        const arrays = [];
+        const walk = (n, path, depth) => {
+          if (!n || depth > 6) return;
+          if (Array.isArray(n)) {
+            if (n.length > 0 && typeof n[0] === 'object' && n[0] !== null) {
+              const firstKeys = Object.keys(n[0]).slice(0, 20);
+              arrays.push({ path, count: n.length, firstKeys });
+            }
+            return;
+          }
+          if (typeof n === 'object') {
+            for (const [k, v] of Object.entries(n)) walk(v, path ? path + '.' + k : k, depth + 1);
+          }
+        };
+        walk(r.json, '', 0);
+        bookingLog('search_reservations: API', { url: r.url.slice(0, 120), topKeys: Object.keys(r.json).slice(0, 10), arrays: arrays.slice(0, 8) });
+        // Score by reservation-ish keys
+        for (const a of arrays) {
+          const kstr = a.firstKeys.join(',').toLowerCase();
+          // Reservations should have DATES + AMOUNT + GUEST-ish
+          const hasDate = /check[_-]?in|arrival|checkin_date|arrival_date|dt_in/.test(kstr);
+          const hasAmount = /amount|price|total|revenue|room_price/.test(kstr);
+          const hasGuest = /guest_name|booker_name|guest_first|customer|guest\.|room_name/.test(kstr);
+          if (hasDate && (hasAmount || hasGuest)) {
+            // pick the largest matching array
+            if (!chosen || a.count > chosen.array.count) chosen = { array: a, response: r };
+          }
+        }
+      }
+      if (chosen) {
+        bookingLog('search_reservations: chosen array', { path: chosen.array.path, count: chosen.array.count, firstKeys: chosen.array.firstKeys, url: chosen.response.url.slice(0, 120) });
+        const arr = chosen.array.path.split('.').reduce((o, k) => o?.[k], chosen.response.json);
+        if (Array.isArray(arr) && arr.length > 0) {
+          bookingLog('search_reservations: first record', { sample: JSON.stringify(arr[0]).slice(0, 500) });
+          return arr.map(r => ({
+            guest:     r.guest_name ?? r.booker_name ?? r.customer_name ?? (r.guest && r.guest.name) ?? '',
+            checkin:   r.checkin ?? r.check_in ?? r.arrival ?? r.arrival_date ?? r.dt_in ?? r.checkin_date ?? '',
+            checkout:  r.checkout ?? r.check_out ?? r.departure ?? r.departure_date ?? r.dt_out ?? r.checkout_date ?? '',
+            status:    normalizeStatus(r.status ?? r.reservation_status ?? r.state ?? r.booking_status ?? ''),
+            total:     r.total_price ?? r.price ?? r.amount ?? r.total ?? r.revenue ?? r.room_price ?? '',
+            bookingId: r.id ?? r.booking_id ?? r.reservation_id ?? r.booking_number ?? r.reservation_number ?? '',
+          }));
+        }
+      }
+      bookingLog('search_reservations: no matching array found — falling through to DOM scrape');
+      apiPromise = Promise.resolve(null); // signal existing code to skip API path
+      await randomDelay(500, 1_000);
+    } else {
+      // ── Navigate to Reservations page (existing default path) ────────────
+      const reservationsLinkSelectors = [
+        'nav a[href*="/groups/reservations/"]',
+        'a[href*="/groups/reservations/"]:visible',
+        'header a:has-text("Reservations")',
+        'nav a:has-text("Reservations")',
+        'a[data-test-id*="reservations"]',
+        'a:has-text("Reservations")',
+      ];
+
+      let clickedNav = false;
+      for (const sel of reservationsLinkSelectors) {
+        try {
+          await page.click(sel, { timeout: 3_000 });
+          bookingLog('clicked Reservations menu link', { sel });
+          clickedNav = true;
+          break;
+        } catch {}
+      }
+
+      if (!clickedNav) {
+        const { reservationsUrl: baseReservationsUrl } = getSavedUrls();
+        const fallbackUrl = withSesParam(page.url(), baseReservationsUrl);
+        bookingLog('reservations link not found — falling back to direct nav', { fallbackUrl });
+        await page.goto(fallbackUrl, { waitUntil: 'domcontentloaded' });
+      }
+
+      await page.waitForLoadState('domcontentloaded').catch(() => {});
+      await page.waitForLoadState('networkidle').catch(() => {});
+      bookingLog('after reservations nav', { url: page.url() });
+
+      assertNotLoginPage(page.url());
+
+      await randomDelay(1_500, 3_500);
+
+      apiPromise = interceptApiResponse(
+        page,
+        /booking-list|reservations|bookings/i
+      );
+
+      // ── Apply date filter — this now calls the fixed commitAndWait() ─────
+      const filterResult = await applyDateFilter(page, start, end);
+      bookingLog('date filter attempt', filterResult);
     }
-
-    if (!clickedNav) {
-      const { reservationsUrl: baseReservationsUrl } = getSavedUrls();
-      const fallbackUrl = withSesParam(page.url(), baseReservationsUrl);
-      bookingLog('reservations link not found — falling back to direct nav', { fallbackUrl });
-      await page.goto(fallbackUrl, { waitUntil: 'domcontentloaded' });
-    }
-
-    await page.waitForLoadState('domcontentloaded').catch(() => {});
-    await page.waitForLoadState('networkidle').catch(() => {});
-    bookingLog('after reservations nav', { url: page.url() });
-
-    assertNotLoginPage(page.url());
-
-    await randomDelay(1_500, 3_500);
-
-    // ── FIX: Set up the API intercept AFTER navigation, BEFORE filter ────────
-    // Previously apiPromise was created before navigation, meaning any API
-    // call that fired on initial page load (before the date filter was applied)
-    // would satisfy the promise with unfiltered/stale data.
-    // Now we set it up immediately before the filter so it only catches the
-    // response triggered by the "Show reservations" button click.
-    const apiPromise = interceptApiResponse(
-      page,
-      /booking-list|reservations|bookings/i
-    );
-
-    // ── Apply date filter — this now calls the fixed commitAndWait() ─────────
-    const filterResult = await applyDateFilter(page, start, end);
-    bookingLog('date filter attempt', filterResult);
 
     // Snapshot the input value AFTER applyDateFilter — confirms whether the
-    // date range actually stuck on the widget (not just visibly).
-    const postFilterInputValue = await page
-      .locator('#peg-reservations-ranged')
-      .first()
-      .inputValue()
-      .catch(() => '');
-    bookingLog('post-filter input value', { value: postFilterInputValue, expected: `${start} … ${end}` });
+    // date range actually stuck on the widget (not just visibly). Skip on the
+    // useSearchUrl path since the date-range widget isn't rendered there.
+    if (!useSearchUrl) {
+      const postFilterInputValue = await page
+        .locator('#peg-reservations-ranged')
+        .first()
+        .inputValue()
+        .catch(() => '');
+      bookingLog('post-filter input value', { value: postFilterInputValue, expected: `${start} … ${end}` });
+    }
 
     // ── Try API interception first (fastest, most reliable) ──────────────────
+    // Register a persistent collector that captures EVERY matching API response
+    // so we can aggregate paginated results (Booking returns 30 per page).
+    const _paginatedApiResponses = [];
+    const _paginationHandler = async (response) => {
+      try {
+        const url = response.url();
+        if (!/booking-list|reservations|bookings/i.test(url)) return;
+        const ct = response.headers()['content-type'] ?? '';
+        if (!ct.includes('json')) return;
+        if (!response.ok()) return;
+        const json = await response.json().catch(() => null);
+        if (json) _paginatedApiResponses.push(json);
+      } catch { /* ignore */ }
+    };
+    page.on('response', _paginationHandler);
+
     const apiData = await apiPromise;
     if (apiData) {
       const items =
@@ -968,10 +1187,110 @@ async function _getBookingReservations({ startDate, endDate } = {}) {
         (Array.isArray(apiData) ? apiData : null);
 
       bookingLog('API intercept returned data', {
-        topKeys: typeof apiData === 'object' ? Object.keys(apiData ?? {}).slice(0, 8) : typeof apiData,
+        topKeys: typeof apiData === 'object' ? Object.keys(apiData ?? {}).slice(0, 15) : typeof apiData,
         itemsIsArray: Array.isArray(items),
         itemCount: Array.isArray(items) ? items.length : null,
       });
+
+      // Scroll-paginate: if the first response returned exactly 30 rows (or
+      // any suspicious "full page"), scroll to trigger additional API calls
+      // and collect all responses.
+      if (Array.isArray(items) && items.length >= 30) {
+        bookingLog('API returned full page, scrolling for more pages');
+        const SCROLL_MAX_MS = 30_000;
+        const scrollStart = Date.now();
+        let prevRespCount = _paginatedApiResponses.length;
+        let stableScrolls = 0;
+        for (let iter = 0; iter < 20; iter++) {
+          if (Date.now() - scrollStart > SCROLL_MAX_MS) {
+            bookingLog('pagination scroll: time budget exhausted', { iter });
+            break;
+          }
+          await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+          await page.waitForTimeout(1_500);
+          const curRespCount = _paginatedApiResponses.length;
+          if (curRespCount === prevRespCount) {
+            stableScrolls++;
+            if (stableScrolls >= 2) { bookingLog('pagination scroll: no new API responses', { iter, curRespCount }); break; }
+          } else {
+            stableScrolls = 0;
+            bookingLog('pagination scroll: got more responses', { iter, curRespCount });
+          }
+          prevRespCount = curRespCount;
+        }
+        page.off('response', _paginationHandler);
+
+        // Merge all collected pages
+        const seen = new Set();
+        const merged = [];
+        for (const resp of _paginatedApiResponses) {
+          const pageItems =
+            resp?.data?.reservations ?? resp?.reservations ?? resp?.data ??
+            (Array.isArray(resp) ? resp : null);
+          if (!Array.isArray(pageItems)) continue;
+          for (const r of pageItems) {
+            const id = r.id ?? r.booking_id ?? r.reservation_id ?? '';
+            if (!id) { merged.push(r); continue; }
+            if (seen.has(id)) continue;
+            seen.add(id);
+            merged.push(r);
+          }
+        }
+        bookingLog('pagination scroll: merged pages', { pages: _paginatedApiResponses.length, total: merged.length });
+        if (merged.length > items.length) {
+          diagInfo('get_booking_reservations');
+          return merged.map(r => ({
+            guest:     r.guest_name ?? r.booker_name ?? r.guest?.name ?? '',
+            checkin:   r.checkin ?? r.arrival ?? r.check_in ?? '',
+            checkout:  r.checkout ?? r.departure ?? r.check_out ?? '',
+            status:    normalizeStatus(r.status ?? r.reservation_status ?? ''),
+            total:     r.total_price ?? r.price ?? r.amount ?? '',
+            bookingId: r.id ?? r.booking_id ?? r.reservation_id ?? '',
+          }));
+        }
+      } else {
+        page.off('response', _paginationHandler);
+      }
+
+      // Deep inspect: find array fields anywhere in the response for adapters
+      if (!Array.isArray(items) || items.length === 0) {
+        const _foundArrays = [];
+        const _walk = (node, path, depth) => {
+          if (!node || depth > 6) return;
+          if (Array.isArray(node)) {
+            if (node.length > 0 && typeof node[0] === 'object') {
+              _foundArrays.push({ path, count: node.length, firstKeys: Object.keys(node[0]).slice(0, 15) });
+            }
+            return;
+          }
+          if (typeof node === 'object') {
+            for (const [k, v] of Object.entries(node)) _walk(v, path ? path + '.' + k : k, depth + 1);
+          }
+        };
+        _walk(apiData, '', 0);
+        bookingLog('API intercept — no items array matched; found these arrays:', {
+          arrays: _foundArrays.slice(0, 10),
+          fullTopKeys: typeof apiData === 'object' ? Object.keys(apiData ?? {}) : typeof apiData,
+        });
+        // Also try the arrays that look like they might be reservations
+        for (const found of _foundArrays) {
+          const keysStr = found.firstKeys.join(',').toLowerCase();
+          if (/guest|booker|check|arrival|departure|amount|price|status|book/.test(keysStr)) {
+            const arr = found.path.split('.').reduce((o, k) => o?.[k], apiData);
+            if (Array.isArray(arr) && arr.length > 0) {
+              bookingLog('API intercept — using auto-detected array', { path: found.path, count: arr.length, firstItem: JSON.stringify(arr[0]).slice(0, 400) });
+              return arr.map(r => ({
+                guest:     r.guest_name ?? r.booker_name ?? r.guest?.name ?? r.name ?? '',
+                checkin:   r.checkin ?? r.check_in ?? r.arrival ?? r.arrival_date ?? '',
+                checkout:  r.checkout ?? r.check_out ?? r.departure ?? r.departure_date ?? '',
+                status:    normalizeStatus(r.status ?? r.reservation_status ?? r.state ?? ''),
+                total:     r.total_price ?? r.price ?? r.amount ?? r.total ?? r.revenue ?? '',
+                bookingId: r.id ?? r.booking_id ?? r.reservation_id ?? r.booking_number ?? '',
+              }));
+            }
+          }
+        }
+      }
 
       if (Array.isArray(items) && items.length > 0) {
         bookingLog('API first item keys', { sample: JSON.stringify(items[0]).slice(0, 400) });
@@ -981,17 +1300,72 @@ async function _getBookingReservations({ startDate, endDate } = {}) {
           guest:     r.guest_name ?? r.booker_name ?? r.guest?.name ?? '',
           checkin:   r.checkin ?? r.arrival ?? r.check_in ?? '',
           checkout:  r.checkout ?? r.departure ?? r.check_out ?? '',
-          status:    r.status ?? r.reservation_status ?? '',
+          status:    normalizeStatus(r.status ?? r.reservation_status ?? ''),
           total:     r.total_price ?? r.price ?? r.amount ?? '',
           bookingId: r.id ?? r.booking_id ?? r.reservation_id ?? '',
         }));
       }
     } else {
       bookingLog('API intercept produced no JSON response in window');
+      page.off('response', _paginationHandler);
     }
 
     // ── DOM fallback ─────────────────────────────────────────────────────────
     bookingLog('API intercept returned no data — falling back to DOM scrape');
+    // Detach listener defensively if still attached
+    try { page.off('response', _paginationHandler); } catch { /* ignore */ }
+
+    // Paginate: scroll + click "Load more" / "Show more" until row count stabilises.
+    // Booking.com uses infinite scroll or a "Load more" button — try both.
+    //
+    // Termination:
+    //   • Hard cap of PAGINATE_MAX_MS wall-clock so the MCP client (which times
+    //     out around 60s) always gets a response.
+    //   • Also break after two consecutive iterations with no new rows and no
+    //     load-more click — the page has clearly stabilised.
+    const ROW_SELS_FOR_COUNT = [
+      '[data-testid="reservation-row"]', '[data-test-id="reservation-row"]',
+      '[data-test-id*="reservation-list-item"]', 'main table tbody tr',
+    ];
+    const PAGINATE_MAX_MS = 25_000;
+    const paginateStart = Date.now();
+    let prevRowCount = -1;
+    let stableIterations = 0;
+    for (let page_i = 0; page_i < 10; page_i++) {
+      if (Date.now() - paginateStart > PAGINATE_MAX_MS) {
+        bookingLog('pagination time budget exhausted', { page_i, elapsedMs: Date.now() - paginateStart });
+        break;
+      }
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+      await page.waitForTimeout(1_000);
+
+      const loadMoreSelectors = [
+        'button:has-text("Show more")', 'button:has-text("Load more")',
+        '[data-test-id*="load-more"]', '[data-test-id*="show-more"]',
+        '[class*="load-more"]', '[class*="pagination"] a[rel="next"]',
+      ];
+      let loadMoreClicked = false;
+      for (const sel of loadMoreSelectors) {
+        const btn = page.locator(sel).first();
+        if (await btn.count() > 0 && await btn.isVisible().catch(() => false)) {
+          try { await btn.click({ timeout: 2_000 }); await page.waitForTimeout(1_500); loadMoreClicked = true; break; } catch {}
+        }
+      }
+
+      const curCount = await page.evaluate((sels) => {
+        for (const s of sels) { const r = document.querySelectorAll(s); if (r.length) return r.length; }
+        return 0;
+      }, ROW_SELS_FOR_COUNT);
+      bookingLog('pagination step', { page_i, curCount, prevRowCount, loadMoreClicked });
+      if (curCount === prevRowCount && !loadMoreClicked) {
+        stableIterations++;
+        if (stableIterations >= 2) break; // two stable iterations in a row → done
+      } else {
+        stableIterations = 0;
+      }
+      prevRowCount = curCount;
+    }
+
     const scrapeResult = await page.evaluate(() => {
       // Try every known row pattern AND record which one matched + how many.
       const patterns = [
@@ -1057,10 +1431,58 @@ async function _getBookingReservations({ startDate, endDate } = {}) {
         ),
       }));
 
+      // Fallback: if the primary extraction produced empty fields (as happens
+      // on search_reservations.html which lacks data-heading attributes),
+      // extract positionally by reading the <thead>/<th> column names on the
+      // same table. Uses Booking's export column names as the source of truth.
+      const allFieldsEmpty = data.length > 0 && data.every(r =>
+        !r.guest && !r.checkin && !r.checkout && !r.total && !r.bookingId);
+      let headerData = null;
+      let headerNames = [];
+      if (allFieldsEmpty && rows.length > 0) {
+        const table = rows[0].closest('table');
+        if (table) {
+          const headerCells = [
+            ...table.querySelectorAll('thead th, thead td'),
+            ...(table.querySelector('thead') ? [] :
+                [...table.querySelectorAll('tr:first-child th, tr:first-child td')]),
+          ];
+          headerNames = headerCells.map(h => (h.textContent || '').trim());
+          const findIdx = (...needles) => {
+            for (const n of needles) {
+              const idx = headerNames.findIndex(h => h.toLowerCase().includes(n.toLowerCase()));
+              if (idx >= 0) return idx;
+            }
+            return -1;
+          };
+          const iGuest    = findIdx('guest name', 'guest(s)', 'guest', 'booker', 'name');
+          const iCheckin  = findIdx('check-in', 'check in', 'arrival');
+          const iCheckout = findIdx('check-out', 'check out', 'departure');
+          const iStatus   = findIdx('status');
+          const iPrice    = findIdx('price', 'total', 'revenue', 'amount');
+          const iBookNum  = findIdx('book number', 'booking id', 'reservation', 'reference');
+          const cellText = (row, i) => (i >= 0 && row.children[i]) ? (row.children[i].textContent || '').trim() : '';
+          // Rows to iterate: prefer table.tbody tr; if not present, all tr except the first (header)
+          const bodyRows = table.querySelector('tbody')
+            ? [...table.querySelectorAll('tbody tr')]
+            : [...table.querySelectorAll('tr')].slice(1);
+          headerData = bodyRows.map(row => ({
+            guest:     cellText(row, iGuest),
+            checkin:   cellText(row, iCheckin),
+            checkout:  cellText(row, iCheckout),
+            status:    cellText(row, iStatus),
+            total:     cellText(row, iPrice),
+            bookingId: cellText(row, iBookNum),
+          }));
+        }
+      }
+
       return {
         counts,
         matched,
         data,
+        headerData,
+        headerNames,
         firstRowHtml: rows[0]?.innerHTML?.slice(0, 3000) ?? '',
         columnHeadings: [...new Set([...document.querySelectorAll('td[data-heading]')].map(td => td.getAttribute('data-heading')))],
         bodyExcerpt: document.body?.innerText?.slice(0, 800) ?? '',
@@ -1074,15 +1496,24 @@ async function _getBookingReservations({ startDate, endDate } = {}) {
     bookingLog('DOM scrape patterns tried', scrapeResult.counts);
     bookingLog('DOM first row HTML', { html: scrapeResult.firstRowHtml });
     bookingLog('DOM column headings', { headings: scrapeResult.columnHeadings });
+    bookingLog('DOM header names', { headers: scrapeResult.headerNames });
     bookingLog('DOM scrape outcome', {
       matchedPattern: scrapeResult.matched,
       rowCount: scrapeResult.data.length,
+      headerFallbackCount: scrapeResult.headerData ? scrapeResult.headerData.length : null,
       isEmptyState: scrapeResult.isEmptyState,
     });
 
-    if (scrapeResult.data.length > 0) {
+    // Prefer the header-fallback data when the primary extractor returned
+    // empty rows (e.g. on search_reservations.html which has no data-heading
+    // attributes but has proper <thead>/<th> column names).
+    const finalData = (scrapeResult.headerData && scrapeResult.headerData.length > 0)
+      ? scrapeResult.headerData
+      : scrapeResult.data;
+
+    if (finalData.length > 0) {
       diagInfo('get_booking_reservations');
-      return scrapeResult.data;
+      return finalData.map(r => ({ ...r, status: normalizeStatus(r.status) }));
     }
 
     // No rows AND no API data — return the raw page excerpt for debugging
@@ -1101,7 +1532,7 @@ async function _getBookingReservations({ startDate, endDate } = {}) {
 }
 
 export async function getBookingMessages() {
-  return _bookingSerialize(() => _getBookingMessages());
+  return _bookingSerialize(() => _autoRefreshOnExpiry(() => _getBookingMessages()));
 }
 async function _getBookingMessages() {
   resetDiag();
@@ -1119,7 +1550,7 @@ async function _getBookingMessages() {
     bookingLog('messages: after warm-up nav', { url: page.url() });
 
     if (isLoginUrl(page.url())) {
-      throw new Error(`Session expired at warm-up (landed on: ${page.url()}) — run: node save-session.js booking`);
+      throw new Error(`Session expired at warm-up (landed on: ${page.url()}) — run: node save-session.js booking (or call the refresh_booking_session MCP tool)`);
     }
 
     await randomDelay(2_000, 4_000);
@@ -1247,7 +1678,7 @@ async function _getBookingMessages() {
 }
 
 export async function getBookingEarnings({ year, month } = {}) {
-  return _bookingSerialize(() => _getBookingEarnings({ year, month }));
+  return _bookingSerialize(() => _autoRefreshOnExpiry(() => _getBookingEarnings({ year, month })));
 }
 
 async function _getBookingEarnings({ year, month } = {}) {
@@ -1267,7 +1698,7 @@ async function _getBookingEarnings({ year, month } = {}) {
     bookingLog('earnings: home page loaded', { url: page.url() });
 
     if (isLoginUrl(page.url())) {
-      throw new Error(`Session expired (landed on: ${page.url()}) — run: node save-session.js booking`);
+      throw new Error(`Session expired (landed on: ${page.url()}) — run: node save-session.js booking (or call the refresh_booking_session MCP tool)`);
     }
 
     await randomDelay(1_500, 3_000);
@@ -1335,7 +1766,7 @@ async function _getBookingEarnings({ year, month } = {}) {
     }
 
     if (payoutsStatus >= 400) {
-      throw new Error(`Payouts page returned HTTP ${payoutsStatus} — re-run: node save-session.js booking`);
+      throw new Error(`Payouts page returned HTTP ${payoutsStatus} — re-run: node save-session.js booking (or call the refresh_booking_session MCP tool)`);
     }
     assertNotLoginPage(page.url());
     bookingLog('earnings: confirmed on payouts page', { url: page.url() });
@@ -1385,15 +1816,21 @@ async function _getBookingEarnings({ year, month } = {}) {
     bookingLog('earnings: API returned no data — DOM scrape');
 
     const scraped = await page.evaluate(() => {
-      // ── Summary amounts ─────────────────────────────────────────────────────
-      const summary = {};
-      // Collect any heading-level amount text visible on the page
-      document.querySelectorAll('h1,h2,h3,h4,[class*="total"],[class*="amount"],[class*="balance"],[class*="summary"]').forEach(el => {
-        const text = el.textContent?.trim();
-        if (text && /[£€$¥\d]/.test(text) && text.length < 120) {
-          summary[el.tagName + '_' + (el.className || el.id || '').slice(0, 30)] = text;
-        }
-      });
+      // ── Summary — real fields, not class-name keys ───────────────────────────
+      const bodyText = document.body?.innerText ?? '';
+      const amtRe = /[£€$]\s*[\d,]+\.?\d*/g;
+      const amtMatches = [...bodyText.matchAll(amtRe)].map(m => m[0]);
+      const currency = amtMatches[0]?.match(/[£€$]/)?.[0] ?? '£';
+      // Look for labelled amounts first
+      const labelledAmt = (label) => {
+        const re = new RegExp(label + '[\\s\\S]{0,30}?([£€$]\\s*[\\d,]+\\.?\\d*)', 'i');
+        return (re.exec(bodyText) ?? [])[1] ?? null;
+      };
+      const summary = {
+        totalPaid:       labelledAmt('total|balance|amount paid') ?? amtMatches[0] ?? null,
+        lastPayoutDate:  (bodyText.match(/\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}/) ?? [])[0] ?? null,
+        currency,
+      };
 
       // ── Payment history rows ────────────────────────────────────────────────
       // Try progressively broader selectors. The payment history section lives
@@ -1438,23 +1875,59 @@ async function _getBookingEarnings({ year, month } = {}) {
         })
         .slice(0, 50)
         .map(row => {
-          const cells = [...row.querySelectorAll('td, [class*="cell"], [class*="col"]')];
-          const cellTexts = cells.map(c => c.textContent?.trim() ?? '');
+          const tds = [...row.querySelectorAll('td')];
+          const td  = (i) => tds[i]?.textContent?.trim() ?? '';
+          const raw = row.textContent?.trim() ?? '';
+
+          // Detect amount cell: contains currency symbol
+          const amtCell = tds.find(c => /[£€$]/.test(c.textContent ?? ''));
+          const amount  = amtCell?.textContent?.trim() ?? '';
+
+          // Detect status cell: short text like "Sent", "Pending", "Paid"
+          const statusCell = tds.find(c => {
+            const t = c.textContent?.trim() ?? '';
+            return /^(sent|paid|pending|cancelled|failed|processing)$/i.test(t);
+          });
+          const statusRaw = statusCell?.textContent?.trim() ?? '';
+
+          // Detect booking ID: alphanumeric 8-16 chars, no spaces
+          const idCell  = tds.find(c => /^[A-Za-z0-9]{8,20}$/.test(c.textContent?.trim() ?? ''));
+          const id      = idCell?.textContent?.trim()
+                       ?? row.getAttribute('data-payout-id')
+                       ?? row.getAttribute('data-id') ?? '';
+
+          // Detect period: contains " - " date range
+          const periodCell = tds.find(c => / - /.test(c.textContent ?? '') && /\w{3}/.test(c.textContent ?? ''));
+          const period     = periodCell?.textContent?.trim() ?? '';
+          const periodParts = period.match(/^(.+?)\s*-\s*(.+)$/);
+
+          // Payout date: first td that looks like a date but is NOT the period range
+          const dateCells = tds.filter(c => {
+            const t = c.textContent?.trim() ?? '';
+            return /\d{1,2}\s+[A-Za-z]{3}/.test(t) && !t.includes(' - ') && t.length < 30;
+          });
+          const payoutDate = dateCells[0]?.textContent?.trim() ?? td(0);
+
           return {
-            period: row.querySelector('[class*="period"],[data-test-id*="period"]')?.textContent?.trim() ?? cellTexts[0] ?? '',
-            date:   row.querySelector('[class*="date"],[data-test-id*="date"]')?.textContent?.trim()    ?? cellTexts[1] ?? '',
-            amount: row.querySelector('[class*="amount"],[class*="price"],[class*="total"],[data-test-id*="amount"]')?.textContent?.trim()
-                    ?? cellTexts[cellTexts.length - 1] ?? '',
-            status: row.querySelector('[class*="status"],[class*="badge"],[class*="state"]')?.textContent?.trim() ?? '',
-            id:     row.getAttribute('data-payout-id') ?? row.getAttribute('data-payment-id') ?? row.getAttribute('data-id') ?? '',
-            _raw:   row.textContent?.trim().slice(0, 200) ?? '',
+            payoutDate,
+            periodStart: periodParts ? periodParts[1].trim() : period,
+            periodEnd:   periodParts ? periodParts[2].trim() : '',
+            id,
+            status:      statusRaw,
+            amount,
           };
         });
 
-      // Always include a body excerpt — useful whether or not rows were found.
-      const _bodyExcerpt = document.body?.innerText?.slice(0, 2000) ?? '';
+      // Only include the raw body excerpt when we didn't manage to parse
+      // structured transaction rows — saves ~2KB per response otherwise.
+      const _bodyExcerpt = transactions.length === 0
+        ? (document.body?.innerText?.slice(0, 2000) ?? '')
+        : undefined;
 
-      return { summary, transactions, matchedSel, _bodyExcerpt };
+      return {
+        summary, transactions, matchedSel,
+        ...(_bodyExcerpt !== undefined && { _bodyExcerpt })
+      };
     });
 
     bookingLog('earnings DOM result', {
@@ -1462,12 +1935,36 @@ async function _getBookingEarnings({ year, month } = {}) {
       txCount: scraped.transactions.length,
       summaryKeys: Object.keys(scraped.summary ?? {}).length,
     });
+
+    // ── Year sanity check ────────────────────────────────────────────────────
+    // The Booking Extranet payouts page ignores query-string year filtering —
+    // it always shows current payout history. If the caller asked for a
+    // different year, filter the scraped transactions to that year's payouts
+    // (using payoutDate → year) so downstream consumers don't get mixed data.
+    const requestedYear = year ?? new Date().getFullYear();
+    let filteredTx = scraped.transactions;
+    let yearFiltered = false;
+    if (year != null && Array.isArray(scraped.transactions)) {
+      const inYear = (t) => {
+        const d = t && t.payoutDate ? new Date(String(t.payoutDate).replace('Sept', 'Sep')) : null;
+        return d && !isNaN(d) && d.getFullYear() === requestedYear;
+      };
+      filteredTx = scraped.transactions.filter(inYear);
+      yearFiltered = filteredTx.length !== scraped.transactions.length;
+      if (yearFiltered) {
+        bookingLog('earnings: filtered transactions to requested year', {
+          requestedYear, before: scraped.transactions.length, after: filteredTx.length,
+        });
+      }
+    }
     diagInfo('get_booking_earnings');
 
     return {
-      year: year ?? new Date().getFullYear(),
+      year: requestedYear,
       month: month ?? null,
       ...scraped,
+      transactions: filteredTx,
+      ...(yearFiltered && { _yearFiltered: true }),
       _source: 'dom',
     };
 
@@ -1479,7 +1976,7 @@ async function _getBookingEarnings({ year, month } = {}) {
 }
 
 export async function getBookingCalendar(months = 3) {
-  return _bookingSerialize(() => _getBookingCalendar(months));
+  return _bookingSerialize(() => _autoRefreshOnExpiry(() => _getBookingCalendar(months)));
 }
 async function _getBookingCalendar(months = 3) {
   resetDiag();
@@ -1497,7 +1994,7 @@ async function _getBookingCalendar(months = 3) {
     bookingLog('calendar: after warm-up nav', { url: page.url() });
 
     if (isLoginUrl(page.url())) {
-      throw new Error(`Session expired at warm-up (landed on: ${page.url()}) — run: node save-session.js booking`);
+      throw new Error(`Session expired at warm-up (landed on: ${page.url()}) — run: node save-session.js booking (or call the refresh_booking_session MCP tool)`);
     }
 
     await randomDelay(2_000, 4_000);
@@ -1634,4 +2131,104 @@ async function _getBookingCalendar(months = 3) {
   } finally {
     await closeBrowserContext(ctx);
   }
+}
+
+// ─── Monthly gross revenue by check-in month ─────────────────────────────
+// Aggregates confirmed reservation totals for a whole year, grouped by
+// check-in month. This is the "gross" figure that matches Booking Extranet's
+// Reservations export (guest-paid amount, before Booking's commission), and
+// is what most hosts consider "monthly revenue".
+//
+// Implementation: wraps _getBookingReservations with startDate=YYYY-01-01 /
+// endDate=YYYY-12-31 and buckets by check-in month. Any reservation the
+// underlying scraper doesn't return (e.g. very old past stays Booking hides)
+// simply won't be counted — the response includes rawReservationCount so
+// callers can detect when the API dropped stays vs actually returning zero.
+export async function getBookingMonthlyGross(year) {
+  return _bookingSerialize(() => _autoRefreshOnExpiry(() => _getBookingMonthlyGross(year)));
+}
+async function _getBookingMonthlyGross(year) {
+  const y = year ?? new Date().getFullYear();
+  const startDate = `${y}-01-01`;
+  const endDate   = `${y}-12-31`;
+  resetDiag();
+  bookingLog('getBookingMonthlyGross', { year: y, startDate, endDate });
+
+  // Reuse the reservations scraper directly (skip the outer serialize wrapper
+  // — we're already inside _bookingSerialize). Use search_reservations.html
+  // so past + future stays are both included (the default reservations page
+  // only shows current+upcoming).
+  const reservations = await _getBookingReservations({ startDate, endDate, useSearchUrl: true });
+  bookingLog('monthlyGross: raw reservation count', { count: Array.isArray(reservations) ? reservations.length : 0 });
+
+  const MONTH_NAMES_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const monthly = MONTH_NAMES_SHORT.map((m, i) => ({
+    month: m, monthNumber: i + 1, gross: 0, count: 0, reservations: [],
+  }));
+
+  const parseAmount = (s) => {
+    if (s == null) return 0;
+    if (typeof s === 'number') return s;
+    const m = String(s).match(/[\d,]+(?:\.\d+)?/);
+    return m ? parseFloat(m[0].replace(/,/g, '')) : 0;
+  };
+  const parseDate = (s) => {
+    if (!s) return null;
+    const d = new Date(String(s).replace('Sept', 'Sep'));
+    return isNaN(d) ? null : d;
+  };
+
+  let confirmedTotal = 0, confirmedCount = 0, dropped = 0;
+  const rows = Array.isArray(reservations) ? reservations : [];
+  for (const r of rows) {
+    // Skip the debug _raw shell returned when the scraper found no rows
+    if (r && r._raw && Object.keys(r).length === 1) { dropped++; continue; }
+    const status = String(r.status || '').toLowerCase();
+    if (status !== 'confirmed' && !/^ok/.test(status)) { dropped++; continue; }
+    const d = parseDate(r.checkin);
+    if (!d || d.getFullYear() !== y) { dropped++; continue; }
+    const amt = parseAmount(r.total);
+    if (amt <= 0) { dropped++; continue; }
+    const idx = d.getMonth();
+    monthly[idx].gross += amt;
+    monthly[idx].count++;
+    monthly[idx].reservations.push({
+      guest: r.guest || '',
+      checkin: r.checkin,
+      checkout: r.checkout,
+      total: amt,
+      bookingId: r.bookingId || '',
+    });
+    confirmedTotal += amt;
+    confirmedCount++;
+  }
+
+  monthly.forEach(m => { m.gross = Math.round(m.gross * 100) / 100; });
+
+  const result = {
+    year: y,
+    currency: '£',
+    monthly,
+    summary: {
+      totalGross: Math.round(confirmedTotal * 100) / 100,
+      confirmedReservations: confirmedCount,
+      rawReservationCount: rows.length,
+      droppedCount: dropped,
+    },
+    // Include a small sample of the raw records when everything gets dropped
+    // — helps diagnose field-shape mismatches on the search_reservations page.
+    ...(dropped > 0 && confirmedCount === 0 && rows.length > 0 && {
+      _sampleRawRecords: rows.slice(0, 3).map(r => ({
+        keys: r ? Object.keys(r) : [],
+        preview: r ? Object.fromEntries(Object.entries(r).map(([k, v]) => [k, typeof v === 'string' ? v.slice(0, 80) : v])) : null,
+      })),
+      _rawReservationsDebug: 'call get_booking_reservations with the same date range for more DOM detail',
+    }),
+  };
+  bookingLog('getBookingMonthlyGross result', {
+    year: y, totalGross: result.summary.totalGross,
+    confirmed: confirmedCount, raw: rows.length, dropped,
+  });
+  diagInfo('get_booking_monthly_gross');
+  return result;
 }

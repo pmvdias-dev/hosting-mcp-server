@@ -6,7 +6,8 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
 import { getAirbnbReservations, getAirbnbMessages, getAirbnbCalendar, getAirbnbEarnings } from './scrapers/airbnb.js';
-import { getBookingReservations, getBookingCalendar, getBookingMessages, getBookingEarnings } from './scrapers/booking.js';
+import { getBookingReservations, getBookingCalendar, getBookingMessages, getBookingEarnings, getBookingMonthlyGross } from './scrapers/booking.js';
+import { saveBookingSession, saveAirbnbSession } from './save-session.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LOG_FILE = join(__dirname, 'mcp-server.log');
@@ -97,6 +98,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'refresh_booking_session',
+      description: 'Opens a visible browser window to log into Booking.com and refresh the saved session. Call this whenever a Booking.com tool (get_booking_reservations, get_booking_calendar, get_booking_messages, get_earnings_summary) fails with a "Session expired" error. The user logs in on the window that opens; the session is detected and saved automatically once valid (no need to press Enter or run any command), and the browser closes itself. Takes up to 10 minutes — only returns once the user has logged in, the browser was closed early, or it times out. Avoid calling any other Booking.com tool while this is in progress, since it uses the same browser profile.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+    },
+    {
+      name: 'refresh_airbnb_session',
+      description: 'Opens a visible browser window to log into Airbnb and refresh the saved session. Call this whenever an Airbnb tool (get_airbnb_reservations, get_airbnb_messages, get_airbnb_calendar, get_earnings_summary) fails with a "session expired" error. The user logs in on the window that opens; cookies are saved automatically once the hosting dashboard is detected (no need to press Enter or run any command). It then optionally waits for the user to click through to Earnings > Paid (needed for payout data, including any 2FA code) — the browser closes itself once that\'s done, or the user can just close it early to skip that step. Takes up to 15 minutes.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+    },
+    {
       name: 'get_earnings_summary',
       description: 'Get revenue and earnings summary from Airbnb and Booking.com. Returns total earnings, payouts, and recent transactions. Defaults to the current year. Optionally filter by year or month.',
       inputSchema: {
@@ -104,6 +121,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           year:  { type: 'number', description: 'Year to fetch earnings for (e.g. 2025). Defaults to current year.' },
           month: { type: 'number', description: 'Month to filter by, 1–12. Optional — omit to get the full year view.' },
+        },
+      },
+    },
+    {
+      name: 'get_booking_monthly_gross',
+      description: 'Get Booking.com gross revenue per month for a whole year, aggregated from the Reservations table (filtered by check-in date). Returns monthly totals with reservation counts and a per-month list of confirmed stays. This is the "gross" figure (guest-paid amount before Booking commission) — matches what the Booking Extranet Reservations export shows. Defaults to the current year.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          year: { type: 'number', description: 'Year to fetch (e.g. 2026). Defaults to current year.' },
         },
       },
     },
@@ -135,6 +162,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case 'get_booking_messages':
         result = await getBookingMessages();
+        break;
+      case 'refresh_booking_session':
+        result = await saveBookingSession();
+        break;
+      case 'refresh_airbnb_session':
+        result = await saveAirbnbSession();
         break;
       case 'get_unified_calendar': {
         const months = args?.months ?? 3;
@@ -200,6 +233,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
         break;
       }
+      case 'get_booking_monthly_gross':
+        result = await getBookingMonthlyGross(args?.year);
+        break;
       default:
         throw new Error(`Unknown tool: "${name}"`);
     }
