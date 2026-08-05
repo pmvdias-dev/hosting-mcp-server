@@ -137,20 +137,53 @@ async function _autoRefreshOnExpiry(fn) {
     const msg = String(err?.message || err);
     stderrLog('caught error', { msgHead: msg.slice(0, 200), matchesExpired: /session expired/i.test(msg) });
     if (!/session expired/i.test(msg)) throw err;
-    stderrLog('session expired detected — opening browser for re-login');
-    // Give the closed browser context a beat before we launch a new one for save-session
+    stderrLog('session expired detected — trying automated login first');
+    // Give the closed browser context a beat before we launch a new one.
     await new Promise((r) => setTimeout(r, 500));
-    let refreshResult;
+
+    // Try automated headless login using .env credentials, up to 2 attempts.
+    // Only fall back to the visible manual browser when both attempts fail —
+    // avoids popping the browser when creds are valid and no CAPTCHA is
+    // present, but still recovers gracefully when Booking throws a challenge.
+    let refreshResult = null;
+    let mod;
     try {
-      const mod = await import('../save-session.js');
-      refreshResult = await mod.saveBookingSession();
-    } catch (refreshErr) {
-      const rmsg = refreshErr?.message ?? String(refreshErr);
-      stderrLog('refresh threw', { msg: rmsg });
-      throw new Error(
-        `Session was expired and auto-refresh failed: ${rmsg}. ` +
-        `Try running "node save-session.js booking" manually.`
-      );
+      mod = await import('../save-session.js');
+    } catch (impErr) {
+      throw new Error(`Could not load save-session module: ${impErr?.message ?? impErr}`);
+    }
+    for (let i = 1; i <= 2; i++) {
+      stderrLog(`auto-login attempt ${i}`);
+      try {
+        const auto = await mod.attemptAutoLoginBooking();
+        if (auto?.success) {
+          stderrLog('auto-login succeeded', { attempt: i });
+          refreshResult = auto;
+          break;
+        }
+        stderrLog('auto-login failed', { attempt: i, reason: auto?.reason, message: auto?.message });
+      } catch (autoErr) {
+        stderrLog('auto-login threw', { attempt: i, msg: autoErr?.message });
+      }
+      // Small pause between attempts so we don't hammer Booking on the same
+      // second — helps if the first attempt got flagged transiently.
+      if (i < 2) await new Promise((r) => setTimeout(r, 2500));
+    }
+
+    // If both auto-login attempts failed, fall back to the visible browser
+    // for the user to complete the login (handles CAPTCHA / 2FA / etc.).
+    if (!refreshResult?.success) {
+      stderrLog('auto-login failed twice — opening manual browser');
+      try {
+        refreshResult = await mod.saveBookingSession();
+      } catch (refreshErr) {
+        const rmsg = refreshErr?.message ?? String(refreshErr);
+        stderrLog('manual refresh threw', { msg: rmsg });
+        throw new Error(
+          `Session was expired, auto-login failed twice, and manual browser also failed: ${rmsg}. ` +
+          `Try running "node save-session.js booking" manually.`
+        );
+      }
     }
     stderrLog('session refresh completed', { success: !!refreshResult?.success });
     if (!refreshResult?.success) {

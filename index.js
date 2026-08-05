@@ -134,6 +134,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: 'regenerate_cleaner_calendar',
+      description: 'Regenerate the cleaner-facing reservations.ics file from live Airbnb + Booking reservations, then commit and push it to the GitHub repo so the cleaner\'s Google Calendar subscription picks up the change. Fires the local generator script (generate-calendar.js) followed by git add/commit/push. Safe to call repeatedly — git commit is a no-op if nothing changed. Returns stdout/stderr from each step for debugging.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+    },
   ],
 }));
 
@@ -236,6 +244,63 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'get_booking_monthly_gross':
         result = await getBookingMonthlyGross(args?.year);
         break;
+      case 'regenerate_cleaner_calendar': {
+        // Shell out to `node generate-calendar.js` then git add/commit/push.
+        // Runs in the MCP server folder so relative paths resolve correctly.
+        const { execFile } = await import('node:child_process');
+        const { promisify } = await import('node:util');
+        const exec = promisify(execFile);
+        const cwd = __dirname;
+        const steps = [];
+        const runStep = async (label, cmd, args, opts) => {
+          try {
+            const r = await exec(cmd, args, { cwd, timeout: 120_000, ...opts });
+            steps.push({ step: label, ok: true, stdout: (r.stdout || '').slice(0, 4000), stderr: (r.stderr || '').slice(0, 2000) });
+            return r;
+          } catch (e) {
+            steps.push({ step: label, ok: false, error: e.message, stdout: (e.stdout || '').slice(0, 4000), stderr: (e.stderr || '').slice(0, 2000), code: e.code ?? null });
+            throw e;
+          }
+        };
+        // 1. Regenerate reservations.ics
+        try {
+          await runStep('generate', 'node', ['generate-calendar.js']);
+        } catch {
+          result = { ok: false, phase: 'generate', steps };
+          break;
+        }
+        // 2. Stage the file (safe even if no changes)
+        try {
+          await runStep('git-add', 'git', ['add', 'reservations.ics']);
+        } catch {
+          result = { ok: false, phase: 'git-add', steps };
+          break;
+        }
+        // 3. Commit — allowed to no-op if nothing changed
+        const commitMsg = `Auto-update calendar ${new Date().toISOString()}`;
+        try {
+          await runStep('git-commit', 'git', ['commit', '-m', commitMsg]);
+        } catch (e) {
+          // If nothing changed, git exits with code 1 and stdout contains
+          // "nothing to commit". Treat that as success (no push needed).
+          const out = (e.stdout || '') + (e.stderr || '');
+          if (/nothing to commit|no changes added/i.test(out)) {
+            result = { ok: true, unchanged: true, steps };
+            break;
+          }
+          result = { ok: false, phase: 'git-commit', steps };
+          break;
+        }
+        // 4. Push
+        try {
+          await runStep('git-push', 'git', ['push'], { timeout: 60_000 });
+        } catch {
+          result = { ok: false, phase: 'git-push', steps };
+          break;
+        }
+        result = { ok: true, pushed: true, steps };
+        break;
+      }
       default:
         throw new Error(`Unknown tool: "${name}"`);
     }

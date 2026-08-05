@@ -174,18 +174,29 @@ const TZ_BLOCK = [
 
 // ─── Main ─────────────────────────────────────────────────────────────────
 async function main() {
+  // We must have BOTH Airbnb and Booking reservations to produce a trustworthy
+  // cleaner calendar — a one-platform-only file would silently omit cleanings
+  // and mislead the cleaner. If either fetch throws, exit non-zero so the
+  // caller (MCP tool / batch script) leaves the previous .ics untouched.
   console.log('[calendar] fetching Airbnb reservations…');
-  const airbnbRaw = await getAirbnbReservations(500).catch(err => {
-    console.error('[calendar] Airbnb fetch failed:', err.message);
-    return [];
-  });
-  console.log('[calendar] Airbnb rows:', airbnbRaw.length);
-
+  const airbnbP = getAirbnbReservations(500);
   console.log('[calendar] fetching Booking reservations…');
-  const bookingRaw = await getBookingReservations({}).catch(err => {
-    console.error('[calendar] Booking fetch failed:', err.message);
-    return [];
-  });
+  const bookingP = getBookingReservations({});
+  const [airRes, bkRes] = await Promise.allSettled([airbnbP, bookingP]);
+
+  if (airRes.status === 'rejected' || bkRes.status === 'rejected') {
+    const errs = [];
+    if (airRes.status === 'rejected') errs.push('Airbnb: ' + (airRes.reason?.message || airRes.reason));
+    if (bkRes.status  === 'rejected') errs.push('Booking: ' + (bkRes.reason?.message || bkRes.reason));
+    console.error('[calendar] refusing to write file — one or more fetches failed:');
+    errs.forEach(e => console.error('  -', e));
+    console.error('[calendar] previous ' + OUT_PATH + ' left untouched.');
+    process.exit(2);
+  }
+
+  const airbnbRaw = airRes.value;
+  const bookingRaw = bkRes.value;
+  console.log('[calendar] Airbnb rows:', airbnbRaw.length);
   console.log('[calendar] Booking rows:', bookingRaw.length);
 
   const all = [

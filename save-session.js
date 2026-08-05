@@ -17,6 +17,143 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SESSIONS_DIR = join(__dirname, 'sessions');
 
+// ─── Minimal .env reader ─────────────────────────────────────────────────
+// No dotenv dependency — parses KEY=VALUE lines from ./env at the repo root.
+function loadEnv() {
+  const envPath = join(__dirname, '.env');
+  if (!fs.existsSync(envPath)) return {};
+  const out = {};
+  const raw = fs.readFileSync(envPath, 'utf-8');
+  raw.split(/\r?\n/).forEach(line => {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) return;
+    const idx = t.indexOf('=');
+    if (idx < 0) return;
+    const key = t.slice(0, idx).trim();
+    let val = t.slice(idx + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    out[key] = val;
+  });
+  return out;
+}
+
+// ─── Booking automated login ─────────────────────────────────────────────
+// Uses stored credentials from .env (BOOKING_EMAIL + BOOKING_PASSWORD) to
+// perform a headless login and refresh the persistent Playwright profile.
+// Returns { success, reason?, message? }. Kept isolated from saveBookingSession
+// so the manual browser flow is untouched.
+export async function attemptAutoLoginBooking({ log = null } = {}) {
+  const emit = log ?? ((msg) => process.stderr.write(`[auto-login-booking] ${msg}\n`));
+  const env = loadEnv();
+  const email = env.BOOKING_EMAIL;
+  const password = env.BOOKING_PASSWORD;
+  if (!email || !password) {
+    emit('no BOOKING_EMAIL/BOOKING_PASSWORD in .env — cannot auto-login');
+    return { success: false, reason: 'no-credentials' };
+  }
+  const { profileDir } = PLATFORMS.booking;
+  fs.mkdirSync(profileDir, { recursive: true });
+
+  const pinnedUA = generateAndPinUserAgent();
+  const proxy = getProxyConfig();
+
+  let context;
+  try {
+    context = await chromiumExtra.launchPersistentContext(profileDir, {
+      headless: true,
+      args: [...STEALTH_LAUNCH_ARGS],
+      viewport: { width: 1280, height: 800 },
+      userAgent: pinnedUA,
+      ...(proxy ? { proxy } : {}),
+    });
+  } catch (err) {
+    emit(`launch failed: ${err.message}`);
+    return { success: false, reason: 'launch-failed', message: err.message };
+  }
+
+  const page = context.pages()[0] ?? (await context.newPage());
+  try {
+    emit('navigating to admin.booking.com');
+    await page.goto('https://admin.booking.com', { waitUntil: 'domcontentloaded', timeout: 30_000 });
+
+    // Sometimes the persistent profile already has a valid session — in that
+    // case we land straight in the extranet and there's no form to fill.
+    let currentUrl = page.url();
+    if (/\/hotel\//.test(currentUrl) && !/sign-?in|login/i.test(currentUrl)) {
+      emit('already authenticated — session was still valid');
+    } else {
+      // Step 1: username
+      const emailSel = 'input[name="username"], input[type="email"], input[name="email"], input[id*="username" i]';
+      await page.waitForSelector(emailSel, { timeout: 15_000 });
+      await page.fill(emailSel, email);
+      // Continue/Next button
+      const nextBtn = await page.$('button[type="submit"], button:has-text("Next"), button:has-text("Continue")');
+      if (nextBtn) await nextBtn.click();
+
+      // Step 2: password
+      const passSel = 'input[name="password"], input[type="password"], input[id*="password" i]';
+      await page.waitForSelector(passSel, { timeout: 15_000 });
+      await page.fill(passSel, password);
+      const signInBtn = await page.$('button[type="submit"], button:has-text("Sign in"), button:has-text("Log in")');
+      if (signInBtn) await signInBtn.click();
+
+      // Wait for extranet redirect. If we get bounced to CAPTCHA / 2FA /
+      // account picker, `waitForURL` will time out and we'll return failure.
+      await page.waitForURL(/admin\.booking\.com\/hotel/, { timeout: 30_000 })
+        .catch(() => { /* checked below */ });
+      currentUrl = page.url();
+    }
+
+    // Detect challenge / non-extranet landings
+    if (/captcha|challenge|verify|2fa|otp|security/i.test(currentUrl)) {
+      emit(`hit challenge page: ${currentUrl}`);
+      return { success: false, reason: 'challenge', message: `Landed on: ${currentUrl}` };
+    }
+    if (!/admin\.booking\.com\/hotel/.test(currentUrl)) {
+      emit(`did not reach extranet — final URL: ${currentUrl}`);
+      return { success: false, reason: 'not-extranet', message: `Final URL: ${currentUrl}` };
+    }
+
+    // Confirm session cookies landed
+    await page.waitForTimeout(1500); // let auth cookies settle
+    const state = await context.storageState();
+    const ssoAuth = state.cookies?.find((c) => c.name === 'bkng_sso_auth');
+    const esadm = state.cookies?.find((c) => c.name === 'esadm');
+    const hasAuth = (ssoAuth?.value?.length ?? 0) >= 50;
+    const hasExtranet = (esadm?.value?.length ?? 0) >= 30;
+    if (!hasAuth || !hasExtranet) {
+      emit(`session cookies missing — hasAuth=${hasAuth} hasExtranet=${hasExtranet}`);
+      return { success: false, reason: 'missing-cookies' };
+    }
+
+    // Persist state.json AND update the saved reservations URL (grab whatever
+    // hotel URL we landed on so subsequent scraper calls use it).
+    const sessionFile = join(SESSIONS_DIR, 'booking-session.json');
+    fs.writeFileSync(sessionFile, JSON.stringify(state, null, 2), 'utf-8');
+
+    const parsedUrl = new URL(currentUrl);
+    parsedUrl.searchParams.delete('ses');
+    const hotelId = parsedUrl.searchParams.get('hotel_id') ?? null;
+    if (hotelId) {
+      fs.writeFileSync(
+        join(SESSIONS_DIR, 'booking-property.json'),
+        JSON.stringify({ hotelId, hotelName: 'Central & Cosy - Easy Access Ground Floor Flat' }, null, 2),
+        'utf-8'
+      );
+    }
+
+    emit(`✓ auto-login succeeded (hotelId=${hotelId ?? 'unknown'})`);
+    return { success: true, hotelId };
+  } catch (err) {
+    emit(`error: ${err.message}`);
+    return { success: false, reason: 'error', message: err.message };
+  } finally {
+    try { await context.close(); } catch { /* ignore */ }
+  }
+}
+
 const PLATFORMS = {
   airbnb: {
     loginUrl: 'https://www.airbnb.com/login',
