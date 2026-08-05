@@ -5,3 +5,4 @@ mcp-server.log
 *.log
 *.png
 .claude/
+sessions/

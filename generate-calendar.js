@@ -16,7 +16,7 @@ import { getBookingReservations } from './scrapers/booking.js';
 
 // ─── Config ───────────────────────────────────────────────────────────────
 const CLEANING_START = '11:00'; // local time
-const CLEANING_END   = '14:45';
+const CLEANING_END   = '15:00';
 const TIMEZONE       = 'Europe/London';
 const PROPERTY_NAME  = 'Central & Cosy — Belfast';
 const CAL_NAME       = 'Belfast Apt — Cleaning Schedule';
@@ -75,6 +75,21 @@ function foldLine(line) {
   return parts.join('\r\n');
 }
 
+// Booking.com's raw `guest` cell often looks like "Ann Pruce2 adults" or
+// "Alžběta Slavíčková2 adults, 2 children (8 and 13 years old)" — the guest
+// name and headcount are jammed together. Extract the numeric headcount here.
+function parseBookingGuestsFromString(str) {
+  if (!str) return null;
+  const adultsM = str.match(/(\d+)\s+adult/i);
+  const childM  = str.match(/(\d+)\s+child(?:ren)?/i);
+  const infantM = str.match(/(\d+)\s+infant/i);
+  const a = adultsM ? parseInt(adultsM[1], 10) : 0;
+  const c = childM  ? parseInt(childM[1], 10)  : 0;
+  const i = infantM ? parseInt(infantM[1], 10) : 0;
+  const t = a + c + i;
+  return t > 0 ? t : null;
+}
+
 // ─── Reservation extraction ──────────────────────────────────────────────
 function normalizeReservation(r, source) {
   const checkin = toIso(r.checkin);
@@ -84,32 +99,31 @@ function normalizeReservation(r, source) {
   const status = String(r.status || '').toLowerCase();
   if (/cancel|declin|expir|no.?show/.test(status)) return null;
 
-  const guest = source === 'Booking.com'
-    ? String(r.guest || '').replace(/\n.*$/s, '').trim()
-    : String(r.guest || '').trim();
-
-  const guests =
+  const guestsFromField =
     r.guests ??
     r.guestCount ??
-    (r.guestBreakdown ? Object.values(r.guestBreakdown).reduce((s, v) => s + (Number(v) || 0), 0) : null) ??
-    null;
+    (r.guestBreakdown ? Object.values(r.guestBreakdown).reduce((s, v) => s + (Number(v) || 0), 0) : null);
+  const guestsFromString = source === 'Booking.com' ? parseBookingGuestsFromString(r.guest) : null;
+  const guests = guestsFromField ?? guestsFromString ?? null;
 
-  const uidSeed = r.confirmationCode || r.bookingId || `${source}-${guest}-${checkout}`;
+  // UID keyed on checkout date so back-to-back same-day turnovers still dedupe
+  // to a single cleaning event (see the dedupe pass below).
   return {
-    uid: `${uidSeed}-cleaning@belfast-str`,
+    uid: `cleaning-${checkout}@belfast-str`,
     source,
-    guest: guest || 'Guest',
     guests,
     checkin,
     checkout,
-    total: r.total || '',
   };
 }
 
 function buildEvent(res) {
-  // Privacy: don't expose guest names or reservation totals in the shared
-  // calendar. Cleaner only needs the schedule and headcount.
-  const summary = `Cleaning (${res.source})`;
+  // Privacy: no guest names, no totals. Title includes guest count so cleaner
+  // knows the turnover size at a glance.
+  const gLabel = res.guests != null
+    ? `${res.guests} guest${res.guests === 1 ? '' : 's'}`
+    : 'guest count unknown';
+  const summary = `Cleaning — ${gLabel} (${res.source})`;
   const descLines = [
     res.guests != null ? `Number of guests: ${res.guests}` : null,
     `Check-in:  ${res.checkin ?? 'unknown'}`,
