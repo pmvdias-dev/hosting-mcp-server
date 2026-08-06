@@ -141,10 +141,40 @@ async function _autoRefreshOnExpiry(fn) {
     // Give the closed browser context a beat before we launch a new one.
     await new Promise((r) => setTimeout(r, 500));
 
-    // Try automated headless login using .env credentials, up to 2 attempts.
-    // Only fall back to the visible manual browser when both attempts fail —
-    // avoids popping the browser when creds are valid and no CAPTCHA is
-    // present, but still recovers gracefully when Booking throws a challenge.
+    // ── Auto-login cooldown ──
+    // Booking's fraud system CAPTCHAs the headless browser after too many
+    // login attempts. When we hit CAPTCHA we write a cooldown timestamp; while
+    // it's active we skip auto-login entirely and go straight to the manual
+    // browser. Prevents wasting 30-40s per Booking call retrying against a
+    // CAPTCHA that won't clear until Booking's counter resets.
+    const COOLDOWN_FILE = join(__dirname, '..', 'sessions', 'auto-login-cooldown.json');
+    // 24h cooldown after CAPTCHA: Booking's fraud counter usually clears in
+    // 24-48h if there's no further bot-like activity. Retrying too soon just
+    // resets the counter.
+    const COOLDOWN_MS   = 24 * 60 * 60 * 1000; // 24 hours
+    const readCooldown = () => {
+      try {
+        if (!fs.existsSync(COOLDOWN_FILE)) return null;
+        const j = JSON.parse(fs.readFileSync(COOLDOWN_FILE, 'utf-8'));
+        return typeof j.until === 'number' ? j.until : null;
+      } catch { return null; }
+    };
+    const writeCooldown = () => {
+      try {
+        fs.writeFileSync(COOLDOWN_FILE, JSON.stringify({
+          until: Date.now() + COOLDOWN_MS,
+          reason: 'captcha',
+          setAt: new Date().toISOString(),
+        }), 'utf-8');
+      } catch (e) { stderrLog('failed to write cooldown', { msg: e.message }); }
+    };
+    const cooldownUntil = readCooldown();
+    const inCooldown = cooldownUntil && cooldownUntil > Date.now();
+
+    // Single-shot automated headless login using .env credentials. If it
+    // fails for any reason (CAPTCHA, OTP, bad selector, etc.) we go straight
+    // to the manual browser — no retries. Repeated headless attempts are
+    // what triggered Booking's fraud counter in the first place.
     let refreshResult = null;
     let mod;
     try {
@@ -152,10 +182,17 @@ async function _autoRefreshOnExpiry(fn) {
     } catch (impErr) {
       throw new Error(`Could not load save-session module: ${impErr?.message ?? impErr}`);
     }
-    for (let i = 1; i <= 2; i++) {
+
+    if (inCooldown) {
+      const mins = Math.round((cooldownUntil - Date.now()) / 60000);
+      stderrLog(`auto-login cooldown active — ${mins} min remaining, skipping to manual browser`);
+    }
+
+    for (let i = 1; i <= 1 && !inCooldown; i++) {
       stderrLog(`auto-login attempt ${i}`);
+      let auto = null;
       try {
-        const auto = await mod.attemptAutoLoginBooking();
+        auto = await mod.attemptAutoLoginBooking();
         if (auto?.success) {
           stderrLog('auto-login succeeded', { attempt: i });
           refreshResult = auto;
@@ -164,6 +201,23 @@ async function _autoRefreshOnExpiry(fn) {
         stderrLog('auto-login failed', { attempt: i, reason: auto?.reason, message: auto?.message });
       } catch (autoErr) {
         stderrLog('auto-login threw', { attempt: i, msg: autoErr?.message });
+      }
+      // If Booking demanded an email OTP, retrying is pointless — it'll ask
+      // again. Go straight to the manual browser so the user can enter the
+      // code (and ideally tick "trust this device" so future auto-logins skip
+      // OTP entirely).
+      const isOtpChallenge = auto?.reason === 'challenge' &&
+        /otp|email-code|verify|2fa/i.test(auto?.message || '');
+      if (isOtpChallenge) {
+        stderrLog('OTP challenge detected — skipping remaining auto-login attempts');
+        break;
+      }
+      // If Booking CAPTCHA'd us, no amount of retrying will help until their
+      // fraud counter cools down. Set a 4-hour cooldown and skip to manual.
+      if (auto?.reason === 'captcha') {
+        stderrLog('CAPTCHA detected — engaging 4h auto-login cooldown, skipping to manual');
+        writeCooldown();
+        break;
       }
       // Small pause between attempts so we don't hammer Booking on the same
       // second — helps if the first attempt got flagged transiently.

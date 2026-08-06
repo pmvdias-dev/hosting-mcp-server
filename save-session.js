@@ -74,45 +74,159 @@ export async function attemptAutoLoginBooking({ log = null } = {}) {
   }
 
   const page = context.pages()[0] ?? (await context.newPage());
+  // On any failure we save a screenshot + the current URL to sessions/ so you
+  // can eyeball what page Booking landed on.
+  const dumpDebug = async (label) => {
+    try {
+      const debugPath = join(SESSIONS_DIR, `auto-login-debug-${label}.png`);
+      await page.screenshot({ path: debugPath, fullPage: true });
+      const urlPath = join(SESSIONS_DIR, `auto-login-debug-${label}.txt`);
+      fs.writeFileSync(urlPath, `URL: ${page.url()}\nTITLE: ${await page.title().catch(() => '?')}\n`, 'utf-8');
+      emit(`saved debug screenshot: ${debugPath}`);
+    } catch (e) { emit(`debug dump failed: ${e.message}`); }
+  };
+
+  // Booking's login uses varying selectors — try a broad set, first match wins.
+  // Includes the current data-testid pattern plus historical name/id/aria variants.
+  const EMAIL_SELECTORS = [
+    'input[data-testid*="username" i]',
+    'input[data-testid*="email" i]',
+    'input[data-testid*="loginname" i]',
+    'input[aria-label*="email" i]',
+    'input[aria-label*="username" i]',
+    'input[name="username"]',
+    'input[name="loginname"]',
+    'input[name="email"]',
+    'input[type="email"]',
+    'input[id*="username" i]',
+    'input[id*="loginname" i]',
+    'input[id*="email" i]',
+    'input:not([type="hidden"])[autocomplete*="username" i]',
+    'input:not([type="hidden"])[autocomplete*="email" i]',
+  ];
+  const PASSWORD_SELECTORS = [
+    'input[data-testid*="password" i]',
+    'input[aria-label*="password" i]',
+    'input[name="password"]',
+    'input[type="password"]',
+    'input[id*="password" i]',
+    'input:not([type="hidden"])[autocomplete*="password" i]',
+  ];
+  const SUBMIT_SELECTORS = [
+    'button[type="submit"]:not([disabled])',
+    'button[data-testid*="submit" i]',
+    'button:has-text("Continue")',
+    'button:has-text("Next")',
+    'button:has-text("Sign in")',
+    'button:has-text("Log in")',
+  ];
+
+  async function waitAnySelector(page, selectors, timeoutMs) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      for (const sel of selectors) {
+        const el = await page.$(sel).catch(() => null);
+        if (el) {
+          const visible = await el.isVisible().catch(() => false);
+          if (visible) return { el, sel };
+        }
+      }
+      await page.waitForTimeout(500);
+    }
+    return null;
+  }
+
   try {
     emit('navigating to admin.booking.com');
+    // Let Booking's own redirect chain take us to whatever sign-in URL applies
+    // to this profile (op_token is a per-session nonce — hardcoding an empty
+    // one lands on the wrong variant).
     await page.goto('https://admin.booking.com', { waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await page.waitForTimeout(2000); // let Cloudflare / JS finish
+
+    let currentUrl = page.url();
+    emit(`landed on: ${currentUrl}`);
+
+    // ── CAPTCHA check ──
+    // Booking blocks headless automation with an image-CAPTCHA ("Let's make
+    // sure you're human"). Detect it as early as possible so we don't waste
+    // time trying to find form fields on a page that has none.
+    const detectCaptcha = async () => {
+      const body = await page.evaluate(() => document.body?.innerText || '').catch(() => '');
+      if (/let'?s make sure you'?re human|not a robot|prove you'?re human|choose all the/i.test(body)) return true;
+      const captchaEl = await page.$('img[src*="captcha" i], [class*="captcha" i], [id*="captcha" i]').catch(() => null);
+      return !!captchaEl;
+    };
+    if (await detectCaptcha()) {
+      emit('CAPTCHA detected on page');
+      await dumpDebug('captcha');
+      return { success: false, reason: 'captcha', message: `CAPTCHA on: ${currentUrl}` };
+    }
 
     // Sometimes the persistent profile already has a valid session — in that
-    // case we land straight in the extranet and there's no form to fill.
-    let currentUrl = page.url();
-    if (/\/hotel\//.test(currentUrl) && !/sign-?in|login/i.test(currentUrl)) {
+    // case we bounce straight to the extranet and there's no form to fill.
+    if (/admin\.booking\.com\/hotel/.test(currentUrl) && !/sign-?in|login/i.test(currentUrl)) {
       emit('already authenticated — session was still valid');
     } else {
       // Step 1: username
-      const emailSel = 'input[name="username"], input[type="email"], input[name="email"], input[id*="username" i]';
-      await page.waitForSelector(emailSel, { timeout: 15_000 });
-      await page.fill(emailSel, email);
-      // Continue/Next button
-      const nextBtn = await page.$('button[type="submit"], button:has-text("Next"), button:has-text("Continue")');
-      if (nextBtn) await nextBtn.click();
+      const emailHit = await waitAnySelector(page, EMAIL_SELECTORS, 15_000);
+      if (!emailHit) {
+        emit('email field not found on page');
+        await dumpDebug('no-email-field');
+        return { success: false, reason: 'no-email-field', message: `Final URL: ${page.url()}` };
+      }
+      emit(`email field matched: ${emailHit.sel}`);
+      await emailHit.el.fill(email);
+
+      // Click Continue/Next
+      const nextHit = await waitAnySelector(page, SUBMIT_SELECTORS, 5_000);
+      if (nextHit) { emit(`clicking submit (email step): ${nextHit.sel}`); await nextHit.el.click(); }
+      await page.waitForTimeout(1500);
+      emit(`after email submit: ${page.url()}`);
+
+      // Re-check for CAPTCHA — Booking may only show it after email submit
+      if (await detectCaptcha()) {
+        emit('CAPTCHA detected after email submit');
+        await dumpDebug('captcha-after-email');
+        return { success: false, reason: 'captcha', message: `CAPTCHA on: ${page.url()}` };
+      }
 
       // Step 2: password
-      const passSel = 'input[name="password"], input[type="password"], input[id*="password" i]';
-      await page.waitForSelector(passSel, { timeout: 15_000 });
-      await page.fill(passSel, password);
-      const signInBtn = await page.$('button[type="submit"], button:has-text("Sign in"), button:has-text("Log in")');
-      if (signInBtn) await signInBtn.click();
+      const passHit = await waitAnySelector(page, PASSWORD_SELECTORS, 20_000);
+      if (!passHit) {
+        emit('password field not found');
+        await dumpDebug('no-password-field');
+        // If we're still on Booking's sign-in URL with no password field, it's
+        // almost always a CAPTCHA that the earlier detector missed (iframe /
+        // shadow-root). Treat it as CAPTCHA so the cooldown applies.
+        if (/account\.booking\.com\/sign-in/i.test(page.url())) {
+          return { success: false, reason: 'captcha', message: `Likely CAPTCHA (no password field, still on ${page.url()})` };
+        }
+        return { success: false, reason: 'no-password-field', message: `Final URL: ${page.url()}` };
+      }
+      emit(`password field matched: ${passHit.sel}`);
+      await passHit.el.fill(password);
+
+      const signHit = await waitAnySelector(page, SUBMIT_SELECTORS, 5_000);
+      if (signHit) { emit(`clicking submit (password step): ${signHit.sel}`); await signHit.el.click(); }
 
       // Wait for extranet redirect. If we get bounced to CAPTCHA / 2FA /
       // account picker, `waitForURL` will time out and we'll return failure.
       await page.waitForURL(/admin\.booking\.com\/hotel/, { timeout: 30_000 })
         .catch(() => { /* checked below */ });
       currentUrl = page.url();
+      emit(`post-submit URL: ${currentUrl}`);
     }
 
     // Detect challenge / non-extranet landings
     if (/captcha|challenge|verify|2fa|otp|security/i.test(currentUrl)) {
       emit(`hit challenge page: ${currentUrl}`);
+      await dumpDebug('challenge');
       return { success: false, reason: 'challenge', message: `Landed on: ${currentUrl}` };
     }
     if (!/admin\.booking\.com\/hotel/.test(currentUrl)) {
       emit(`did not reach extranet — final URL: ${currentUrl}`);
+      await dumpDebug('not-extranet');
       return { success: false, reason: 'not-extranet', message: `Final URL: ${currentUrl}` };
     }
 
