@@ -114,9 +114,10 @@ function _bookingSerialize(fn) {
 }
 
 // ─── Auto session refresh ────────────────────────────────────────────────
-// When any scraper call throws "Session expired", automatically trigger the
-// login-browser flow (saveBookingSession) and retry the original call once.
-// If refresh also fails, propagate a clearer combined error.
+// When any scraper call throws "Session expired", open the visible browser
+// so the user can log in manually. Retry the original call once after the
+// session is saved. No automated login attempts, no cooldowns — just the
+// simple flow.
 async function _autoRefreshOnExpiry(fn) {
   const stderrLog = (msg, extra) => {
     const line = JSON.stringify({ ts: new Date().toISOString(), source: 'auto-refresh', msg, ...(extra || {}) });
@@ -128,154 +129,35 @@ async function _autoRefreshOnExpiry(fn) {
       );
     } catch { /* ignore */ }
   };
-  stderrLog('wrapper entered');
   try {
-    const result = await fn();
-    stderrLog('inner fn returned normally');
-    return result;
+    return await fn();
   } catch (err) {
     const msg = String(err?.message || err);
-    stderrLog('caught error', { msgHead: msg.slice(0, 200), matchesExpired: /session expired/i.test(msg) });
     if (!/session expired/i.test(msg)) throw err;
-    stderrLog('session expired detected — trying automated login first');
+    stderrLog('session expired detected — opening manual browser');
     // Give the closed browser context a beat before we launch a new one.
     await new Promise((r) => setTimeout(r, 500));
-
-    // ── Auto-login cooldown ──
-    // Booking's fraud system CAPTCHAs the headless browser after too many
-    // login attempts. When we hit CAPTCHA we write a cooldown timestamp; while
-    // it's active we skip auto-login entirely and go straight to the manual
-    // browser. Prevents wasting 30-40s per Booking call retrying against a
-    // CAPTCHA that won't clear until Booking's counter resets.
-    const COOLDOWN_FILE = join(__dirname, '..', 'sessions', 'auto-login-cooldown.json');
-    // 24h cooldown after CAPTCHA: Booking's fraud counter usually clears in
-    // 24-48h if there's no further bot-like activity. Retrying too soon just
-    // resets the counter.
-    const COOLDOWN_MS   = 24 * 60 * 60 * 1000; // 24 hours
-    const readCooldown = () => {
-      try {
-        if (!fs.existsSync(COOLDOWN_FILE)) return null;
-        const j = JSON.parse(fs.readFileSync(COOLDOWN_FILE, 'utf-8'));
-        return typeof j.until === 'number' ? j.until : null;
-      } catch { return null; }
-    };
-    const writeCooldown = () => {
-      try {
-        fs.writeFileSync(COOLDOWN_FILE, JSON.stringify({
-          until: Date.now() + COOLDOWN_MS,
-          reason: 'captcha',
-          setAt: new Date().toISOString(),
-        }), 'utf-8');
-      } catch (e) { stderrLog('failed to write cooldown', { msg: e.message }); }
-    };
-    const cooldownUntil = readCooldown();
-    const inCooldown = cooldownUntil && cooldownUntil > Date.now();
-
-    // Single-shot automated headless login using .env credentials. If it
-    // fails for any reason (CAPTCHA, OTP, bad selector, etc.) we go straight
-    // to the manual browser — no retries. Repeated headless attempts are
-    // what triggered Booking's fraud counter in the first place.
-    let refreshResult = null;
-    let mod;
+    let refreshResult;
     try {
-      mod = await import('../save-session.js');
-    } catch (impErr) {
-      throw new Error(`Could not load save-session module: ${impErr?.message ?? impErr}`);
+      const mod = await import('../save-session.js');
+      refreshResult = await mod.saveBookingSession();
+    } catch (refreshErr) {
+      const rmsg = refreshErr?.message ?? String(refreshErr);
+      throw new Error(
+        `Session was expired and manual browser refresh failed: ${rmsg}. ` +
+        `Try running "node save-session.js booking" manually.`
+      );
     }
-
-    if (inCooldown) {
-      const mins = Math.round((cooldownUntil - Date.now()) / 60000);
-      stderrLog(`auto-login cooldown active — ${mins} min remaining, skipping to manual browser`);
-    }
-
-    for (let i = 1; i <= 1 && !inCooldown; i++) {
-      stderrLog(`auto-login attempt ${i}`);
-      let auto = null;
-      try {
-        auto = await mod.attemptAutoLoginBooking();
-        if (auto?.success) {
-          stderrLog('auto-login succeeded', { attempt: i });
-          refreshResult = auto;
-          break;
-        }
-        stderrLog('auto-login failed', { attempt: i, reason: auto?.reason, message: auto?.message });
-      } catch (autoErr) {
-        stderrLog('auto-login threw', { attempt: i, msg: autoErr?.message });
-      }
-      // If Booking demanded an email OTP, retrying is pointless — it'll ask
-      // again. Go straight to the manual browser so the user can enter the
-      // code (and ideally tick "trust this device" so future auto-logins skip
-      // OTP entirely).
-      const isOtpChallenge = auto?.reason === 'challenge' &&
-        /otp|email-code|verify|2fa/i.test(auto?.message || '');
-      if (isOtpChallenge) {
-        stderrLog('OTP challenge detected — skipping remaining auto-login attempts');
-        break;
-      }
-      // If Booking CAPTCHA'd us, no amount of retrying will help until their
-      // fraud counter cools down. Set a 4-hour cooldown and skip to manual.
-      if (auto?.reason === 'captcha') {
-        stderrLog('CAPTCHA detected — engaging 4h auto-login cooldown, skipping to manual');
-        writeCooldown();
-        break;
-      }
-      // Small pause between attempts so we don't hammer Booking on the same
-      // second — helps if the first attempt got flagged transiently.
-      if (i < 2) await new Promise((r) => setTimeout(r, 2500));
-    }
-
-    // If both auto-login attempts failed, fall back to the visible browser
-    // for the user to complete the login (handles CAPTCHA / 2FA / etc.).
     if (!refreshResult?.success) {
-      stderrLog('auto-login failed twice — opening manual browser');
-      try {
-        refreshResult = await mod.saveBookingSession();
-      } catch (refreshErr) {
-        const rmsg = refreshErr?.message ?? String(refreshErr);
-        stderrLog('manual refresh threw', { msg: rmsg });
-        throw new Error(
-          `Session was expired, auto-login failed twice, and manual browser also failed: ${rmsg}. ` +
-          `Try running "node save-session.js booking" manually.`
-        );
-      }
-    }
-    stderrLog('session refresh completed', { success: !!refreshResult?.success });
-    if (!refreshResult?.success) {
-      // User closed the browser without logging in — no point retrying.
       throw new Error(
         `Session refresh was cancelled (browser closed before login completed). ` +
         `Please re-run the tool to re-open the login browser.`
       );
     }
-    // Booking's persistent profile has just been written to disk by
-    // saveBookingSession. Launching a new Playwright context immediately after
-    // sometimes races the lockfile release, and even when the launch succeeds
-    // the cookies aren't fully warmed on first request — the extranet redirects
-    // through /login → /admin, and the scraper sees an empty reservations list
-    // instead of the real data. Give the profile a beat, then retry up to twice
-    // with a growing pause; if either attempt returns without a session-expired
-    // error, we take that result.
-    const RETRY_WAITS_MS = [2000, 3500];
-    let lastRetryErr = null;
-    for (let i = 0; i < RETRY_WAITS_MS.length; i++) {
-      await new Promise((r) => setTimeout(r, RETRY_WAITS_MS[i]));
-      stderrLog('post-refresh retry attempt', { attempt: i + 1, waitedMs: RETRY_WAITS_MS[i] });
-      try {
-        const result = await fn();
-        stderrLog('post-refresh retry succeeded', { attempt: i + 1 });
-        return result;
-      } catch (retryErr) {
-        lastRetryErr = retryErr;
-        const rmsg = String(retryErr?.message || retryErr);
-        stderrLog('post-refresh retry failed', { attempt: i + 1, msgHead: rmsg.slice(0, 200) });
-        // If it's not a session issue, bail — no point re-hitting for a real error.
-        if (!/session expired/i.test(rmsg)) throw retryErr;
-      }
-    }
-    throw new Error(
-      `Session was refreshed but reservations still failed after two retries: ` +
-      `${lastRetryErr?.message ?? lastRetryErr}. Try re-running the tool.`
-    );
+    stderrLog('manual login completed — retrying scraper');
+    // Small settle so profile cookies finish writing to disk
+    await new Promise((r) => setTimeout(r, 1500));
+    return await fn();
   }
 }
 
@@ -333,8 +215,13 @@ async function getBrowserContext() {
   const launchArgs = [...STEALTH_LAUNCH_ARGS];
 
   if (profileExists) {
-    bookingLog('launching persistent context (plain chromium, no playwright-extra)', { PROFILE_DIR });
-    const context = await chromium.launchPersistentContext(PROFILE_DIR, {
+    // Use chromiumExtra (stealth plugin) to match the fingerprint used by
+    // save-session.js when logging in. If we used plain chromium here, Booking
+    // would see two different fingerprints — one for the login session, one
+    // for the scraper — and re-trigger auth-assurance (device verification),
+    // invalidating the just-saved session.
+    bookingLog('launching persistent context (chromiumExtra, stealth-matched to save-session)', { PROFILE_DIR });
+    const context = await chromiumExtra.launchPersistentContext(PROFILE_DIR, {
       headless: true,
       args: launchArgs,
       viewport: { width: 1440, height: 900 },
@@ -359,8 +246,8 @@ async function getBrowserContext() {
     );
   }
 
-  bookingLog('launching browser (session file, plain chromium)');
-  const browser = await chromium.launch({
+  bookingLog('launching browser (session file, chromiumExtra stealth)');
+  const browser = await chromiumExtra.launch({
     headless: true,
     args: launchArgs,
     ...(proxy ? { proxy } : {}),
