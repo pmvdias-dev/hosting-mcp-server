@@ -23,6 +23,30 @@ function log(level, toolName, message, extra) {
   fs.appendFileSync(LOG_FILE, line + '\n');
 }
 
+// ─── In-memory scraper cache ─────────────────────────────────────────────
+// The dashboard fires 3-4 tool calls per Reload; the calendar-regen tool
+// then calls the same scrapers again to build the .ics. Without caching,
+// each Reload double-scrapes both Airbnb + Booking. With a short TTL cache
+// keyed by (fn, args), back-to-back calls in the same Reload reuse the
+// result. Cache is invalidated by process restart or TTL expiry — always
+// safe (worst case we serve slightly stale data for 60s).
+const SCRAPER_CACHE_TTL_MS = 60_000;
+const _scraperCache = new Map(); // key → { at, promise }
+async function memoize(fnName, args, fn) {
+  const key = fnName + ':' + JSON.stringify(args ?? {});
+  const now = Date.now();
+  const hit = _scraperCache.get(key);
+  if (hit && now - hit.at < SCRAPER_CACHE_TTL_MS) {
+    log('debug', fnName, 'cache hit', { ageMs: now - hit.at });
+    return hit.promise;
+  }
+  const promise = fn();
+  _scraperCache.set(key, { at: now, promise });
+  // If it rejects, evict so a future retry actually re-runs
+  promise.catch(() => _scraperCache.delete(key));
+  return promise;
+}
+
 const server = new Server(
   { name: 'hosting-mcp', version: '1.0.0' },
   { capabilities: { tools: {} } }
@@ -154,10 +178,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     switch (name) {
       case 'get_airbnb_reservations':
-        result = await getAirbnbReservations(args?.days ?? 30);
+        result = await memoize('get_airbnb_reservations', { days: args?.days ?? 30 },
+          () => getAirbnbReservations(args?.days ?? 30));
         break;
       case 'get_booking_reservations':
-        result = await getBookingReservations({ startDate: args?.startDate, endDate: args?.endDate });
+        result = await memoize('get_booking_reservations', { startDate: args?.startDate, endDate: args?.endDate },
+          () => getBookingReservations({ startDate: args?.startDate, endDate: args?.endDate }));
         break;
       case 'get_airbnb_messages':
         result = await getAirbnbMessages();
@@ -224,65 +250,94 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'get_earnings_summary': {
         const year  = args?.year  ?? null;
         const month = args?.month ?? null;
-        const [airbnbResult, bookingResult] = await Promise.allSettled([
-          getAirbnbEarnings({ year, month }),
-          getBookingEarnings({ year, month }),
-        ]);
-        const airbnb  = airbnbResult.status  === 'fulfilled' ? airbnbResult.value  : null;
-        const booking = bookingResult.status === 'fulfilled' ? bookingResult.value : null;
-        const errors  = [];
-        if (airbnbResult.status  === 'rejected') errors.push(`Airbnb: ${airbnbResult.reason?.message}`);
-        if (bookingResult.status === 'rejected') errors.push(`Booking.com: ${bookingResult.reason?.message}`);
-        result = {
-          period: { year: year ?? new Date().getFullYear(), month: month ?? null },
-          airbnb,
-          booking,
-          ...(errors.length ? { errors } : {}),
-        };
+        result = await memoize('get_earnings_summary', { year, month }, async () => {
+          const [airbnbResult, bookingResult] = await Promise.allSettled([
+            getAirbnbEarnings({ year, month }),
+            getBookingEarnings({ year, month }),
+          ]);
+          const airbnb  = airbnbResult.status  === 'fulfilled' ? airbnbResult.value  : null;
+          const booking = bookingResult.status === 'fulfilled' ? bookingResult.value : null;
+          const errors  = [];
+          if (airbnbResult.status  === 'rejected') errors.push(`Airbnb: ${airbnbResult.reason?.message}`);
+          if (bookingResult.status === 'rejected') errors.push(`Booking.com: ${bookingResult.reason?.message}`);
+          return {
+            period: { year: year ?? new Date().getFullYear(), month: month ?? null },
+            airbnb,
+            booking,
+            ...(errors.length ? { errors } : {}),
+          };
+        });
         break;
       }
       case 'get_booking_monthly_gross':
         result = await getBookingMonthlyGross(args?.year);
         break;
       case 'regenerate_cleaner_calendar': {
-        // Shell out to `node generate-calendar.js` then git add/commit/push.
-        // Runs in the MCP server folder so relative paths resolve correctly.
+        // In-process: fetch reservations via the memoized scrapers (so if the
+        // artifact just fetched them a few seconds ago, we hit cache instead
+        // of re-scraping), build the .ics string, write the file, then git
+        // add/commit/push. Only git is a child process now.
         const { execFile } = await import('node:child_process');
         const { promisify } = await import('node:util');
         const exec = promisify(execFile);
         const cwd = __dirname;
         const steps = [];
-        const runStep = async (label, cmd, args, opts) => {
+        const runGit = async (label, args, opts) => {
           try {
-            const r = await exec(cmd, args, { cwd, timeout: 120_000, ...opts });
-            steps.push({ step: label, ok: true, stdout: (r.stdout || '').slice(0, 4000), stderr: (r.stderr || '').slice(0, 2000) });
+            const r = await exec('git', args, { cwd, timeout: 60_000, ...opts });
+            steps.push({ step: label, ok: true, stdout: (r.stdout || '').slice(0, 2000), stderr: (r.stderr || '').slice(0, 1000) });
             return r;
           } catch (e) {
-            steps.push({ step: label, ok: false, error: e.message, stdout: (e.stdout || '').slice(0, 4000), stderr: (e.stderr || '').slice(0, 2000), code: e.code ?? null });
+            steps.push({ step: label, ok: false, error: e.message, stdout: (e.stdout || '').slice(0, 2000), stderr: (e.stderr || '').slice(0, 1000), code: e.code ?? null });
             throw e;
           }
         };
-        // 1. Regenerate reservations.ics
+
+        // 1. Fetch reservations (memoized — reuses artifact's fresh fetch if <60s old)
+        let airbnbRaw, bookingRaw;
         try {
-          await runStep('generate', 'node', ['generate-calendar.js']);
-        } catch {
-          result = { ok: false, phase: 'generate', steps };
+          [airbnbRaw, bookingRaw] = await Promise.all([
+            memoize('get_airbnb_reservations', { days: 500 }, () => getAirbnbReservations(500)),
+            memoize('get_booking_reservations', { startDate: undefined, endDate: undefined }, () => getBookingReservations({})),
+          ]);
+        } catch (e) {
+          steps.push({ step: 'fetch-reservations', ok: false, error: e.message });
+          result = { ok: false, phase: 'fetch', steps };
           break;
         }
-        // 2. Stage the file (safe even if no changes)
+        steps.push({ step: 'fetch-reservations', ok: true, airbnbRows: airbnbRaw?.length ?? 0, bookingRows: bookingRaw?.length ?? 0 });
+
+        // 2. Build the .ics in-process (no child process, no re-scrape)
+        let ics, eventCount;
         try {
-          await runStep('git-add', 'git', ['add', 'reservations.ics']);
-        } catch {
-          result = { ok: false, phase: 'git-add', steps };
+          const mod = await import('./generate-calendar.js');
+          ({ ics, eventCount } = mod.buildIcsFromReservations({ airbnbRaw, bookingRaw }));
+        } catch (e) {
+          steps.push({ step: 'build-ics', ok: false, error: e.message });
+          result = { ok: false, phase: 'build', steps };
           break;
         }
-        // 3. Commit — allowed to no-op if nothing changed
+
+        // 3. Write to reservations.ics
+        const outPath = join(__dirname, 'reservations.ics');
+        try {
+          fs.writeFileSync(outPath, ics, 'utf-8');
+          steps.push({ step: 'write-ics', ok: true, bytes: ics.length, events: eventCount, path: outPath });
+        } catch (e) {
+          steps.push({ step: 'write-ics', ok: false, error: e.message });
+          result = { ok: false, phase: 'write', steps };
+          break;
+        }
+
+        // 4. git add
+        try { await runGit('git-add', ['add', 'reservations.ics']); }
+        catch { result = { ok: false, phase: 'git-add', steps }; break; }
+
+        // 5. git commit — allowed to no-op if nothing changed
         const commitMsg = `Auto-update calendar ${new Date().toISOString()}`;
         try {
-          await runStep('git-commit', 'git', ['commit', '-m', commitMsg]);
+          await runGit('git-commit', ['commit', '-m', commitMsg]);
         } catch (e) {
-          // If nothing changed, git exits with code 1 and stdout contains
-          // "nothing to commit". Treat that as success (no push needed).
           const out = (e.stdout || '') + (e.stderr || '');
           if (/nothing to commit|no changes added/i.test(out)) {
             result = { ok: true, unchanged: true, steps };
@@ -291,13 +346,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           result = { ok: false, phase: 'git-commit', steps };
           break;
         }
-        // 4. Push
-        try {
-          await runStep('git-push', 'git', ['push'], { timeout: 60_000 });
-        } catch {
-          result = { ok: false, phase: 'git-push', steps };
-          break;
-        }
+
+        // 6. git push
+        try { await runGit('git-push', ['push']); }
+        catch { result = { ok: false, phase: 'git-push', steps }; break; }
+
         result = { ok: true, pushed: true, steps };
         break;
       }

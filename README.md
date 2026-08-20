@@ -111,6 +111,14 @@ tests/                 Node built-in test suite
 dashboard/             React dashboard (Vite)
 ```
 
+## Calendar (ICS)
+
+Regenerate `reservations.ics` (importable into Google Calendar, Apple Calendar, etc.):
+
+```bash
+node generate-calendar.js
+```
+
 ## Tests
 
 ```bash

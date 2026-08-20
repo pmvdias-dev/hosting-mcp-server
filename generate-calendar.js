@@ -11,6 +11,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { getAirbnbReservations } from './scrapers/airbnb.js';
 import { getBookingReservations } from './scrapers/booking.js';
 
@@ -172,12 +173,41 @@ const TZ_BLOCK = [
   'END:VTIMEZONE',
 ].join('\r\n');
 
-// ─── Main ─────────────────────────────────────────────────────────────────
+// ─── Pure builder (in-process reuse) ─────────────────────────────────────
+// Takes already-fetched raw reservations from both platforms and returns the
+// finished iCal string. Exported so the MCP server can call this directly
+// (sharing its own memoized scraper cache) instead of spawning a child node
+// process that re-scrapes.
+export function buildIcsFromReservations({ airbnbRaw = [], bookingRaw = [] } = {}) {
+  const all = [
+    ...airbnbRaw.map(r => normalizeReservation(r, 'Airbnb')),
+    ...bookingRaw.map(r => normalizeReservation(r, 'Booking.com')),
+  ].filter(Boolean);
+
+  const byUid = new Map();
+  all.forEach(r => { if (!byUid.has(r.uid)) byUid.set(r.uid, r); });
+  const events = [...byUid.values()].sort((a, b) => a.checkout.localeCompare(b.checkout));
+
+  const ics = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//airbnb-mcp-server//cleaning-calendar//EN',
+    'CALSCALE:GREGORIAN',
+    'METHOD:PUBLISH',
+    `X-WR-CALNAME:${icsEscape(CAL_NAME)}`,
+    `X-WR-TIMEZONE:${TIMEZONE}`,
+    TZ_BLOCK,
+    ...events.map(buildEvent),
+    'END:VCALENDAR',
+  ].join('\r\n') + '\r\n';
+
+  return { ics, eventCount: events.length };
+}
+
+// ─── CLI entry point ─────────────────────────────────────────────────────
 async function main() {
-  // We must have BOTH Airbnb and Booking reservations to produce a trustworthy
-  // cleaner calendar — a one-platform-only file would silently omit cleanings
-  // and mislead the cleaner. If either fetch throws, exit non-zero so the
-  // caller (MCP tool / batch script) leaves the previous .ics untouched.
+  // Fetches both platforms, refuses to write if either fails, writes ics.
+  // Used when this file is invoked as a script from the terminal or a batch.
   console.log('[calendar] fetching Airbnb reservations…');
   const airbnbP = getAirbnbReservations(500);
   console.log('[calendar] fetching Booking reservations…');
@@ -199,35 +229,20 @@ async function main() {
   console.log('[calendar] Airbnb rows:', airbnbRaw.length);
   console.log('[calendar] Booking rows:', bookingRaw.length);
 
-  const all = [
-    ...airbnbRaw.map(r => normalizeReservation(r, 'Airbnb')),
-    ...bookingRaw.map(r => normalizeReservation(r, 'Booking.com')),
-  ].filter(Boolean);
-
-  // Dedupe by UID (safety net if the same reservation appears twice)
-  const byUid = new Map();
-  all.forEach(r => { if (!byUid.has(r.uid)) byUid.set(r.uid, r); });
-  const events = [...byUid.values()].sort((a, b) => a.checkout.localeCompare(b.checkout));
-  console.log('[calendar] cleaning events to emit:', events.length);
-
-  const ics = [
-    'BEGIN:VCALENDAR',
-    'VERSION:2.0',
-    'PRODID:-//airbnb-mcp-server//cleaning-calendar//EN',
-    'CALSCALE:GREGORIAN',
-    'METHOD:PUBLISH',
-    `X-WR-CALNAME:${icsEscape(CAL_NAME)}`,
-    `X-WR-TIMEZONE:${TIMEZONE}`,
-    TZ_BLOCK,
-    ...events.map(buildEvent),
-    'END:VCALENDAR',
-  ].join('\r\n') + '\r\n';
-
+  const { ics, eventCount } = buildIcsFromReservations({ airbnbRaw, bookingRaw });
+  console.log('[calendar] cleaning events to emit:', eventCount);
   fs.writeFileSync(OUT_PATH, ics, 'utf-8');
   console.log('[calendar] wrote', OUT_PATH, `(${ics.length} bytes)`);
 }
 
-main().catch(err => {
+// Only run main() when invoked as a script (node generate-calendar.js), not
+// when imported by the MCP server. process.argv[1] resolves to the file being
+// executed; compare to this file's own URL.
+const invokedAsScript = process.argv[1] && (
+  process.argv[1] === fileURLToPath(import.meta.url) ||
+  process.argv[1].endsWith('generate-calendar.js')
+);
+if (invokedAsScript) main().catch(err => {
   console.error('[calendar] fatal:', err);
   process.exit(1);
 });

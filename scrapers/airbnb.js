@@ -151,11 +151,13 @@ async function _getAirbnbReservations(days = 30) {
       } catch { /* ignore */ }
     });
 
-    await page.goto('https://www.airbnb.com/hosting/reservations', { waitUntil: 'networkidle', timeout: 30_000 });
+    // domcontentloaded is enough — Airbnb keeps background XHRs alive indefinitely
+    // so networkidle never fires. The explicit waitForSelector below gates on actual data.
+    await page.goto('https://www.airbnb.com/hosting/reservations', { waitUntil: 'domcontentloaded', timeout: 45_000 });
     assertAirbnbNotLoginPage(page.url());
 
     try {
-      await page.waitForSelector('[data-testid="host-reservations-table-row"]', { timeout: 15000 });
+      await page.waitForSelector('[data-testid="host-reservations-table-row"]', { timeout: 25_000 });
     } catch { /* no rows */ }
 
     const rows = await page.evaluate(() => {

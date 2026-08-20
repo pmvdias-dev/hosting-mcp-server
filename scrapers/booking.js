@@ -12,6 +12,26 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROFILE_DIR    = join(__dirname, '../sessions/booking-profile');
+
+// Load .env from the repo root so BOOKING_HEADFUL toggle works without needing
+// dotenv as a dep. Populates process.env for keys not already set.
+(function loadDotEnv() {
+  try {
+    const envPath = join(__dirname, '..', '.env');
+    if (!fs.existsSync(envPath)) return;
+    const raw = fs.readFileSync(envPath, 'utf-8');
+    raw.split(/\r?\n/).forEach(line => {
+      const t = line.trim();
+      if (!t || t.startsWith('#')) return;
+      const idx = t.indexOf('=');
+      if (idx < 0) return;
+      const key = t.slice(0, idx).trim();
+      let val = t.slice(idx + 1).trim();
+      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
+      if (!(key in process.env)) process.env[key] = val;
+    });
+  } catch { /* .env is optional */ }
+})();
 const SESSION_FILE   = join(__dirname, '../sessions/booking-session.json');
 const URLS_FILE      = join(__dirname, '../sessions/booking-urls.json');
 const PROPERTY_FILE  = join(__dirname, '../sessions/booking-property.json');
@@ -133,8 +153,11 @@ async function _autoRefreshOnExpiry(fn) {
     return await fn();
   } catch (err) {
     const msg = String(err?.message || err);
-    if (!/session expired/i.test(msg)) throw err;
-    stderrLog('session expired detected — opening manual browser');
+    // Trigger manual browser for either "session expired" OR the initial
+    // "No Booking.com session found" (fresh install / just wiped the profile).
+    const needsLogin = /session expired|no booking\.com session/i.test(msg);
+    if (!needsLogin) throw err;
+    stderrLog('needs login — opening manual browser', { trigger: msg.slice(0, 120) });
     // Give the closed browser context a beat before we launch a new one.
     await new Promise((r) => setTimeout(r, 500));
     let refreshResult;
@@ -220,9 +243,16 @@ async function getBrowserContext() {
     // would see two different fingerprints — one for the login session, one
     // for the scraper — and re-trigger auth-assurance (device verification),
     // invalidating the just-saved session.
-    bookingLog('launching persistent context (chromiumExtra, stealth-matched to save-session)', { PROFILE_DIR });
+    //
+    // Set BOOKING_HEADFUL=true in .env to make the scraper visible. Slightly
+    // annoying (window flashes during scrapes) but Booking's fraud model
+    // treats headful browsers as much more trustworthy — this is the escape
+    // hatch when Booking keeps sending the scraper to auth-assurance despite
+    // a successful manual login.
+    const wantHeadful = /^(true|1|yes)$/i.test(process.env.BOOKING_HEADFUL || '');
+    bookingLog('launching persistent context (chromiumExtra)', { PROFILE_DIR, headful: wantHeadful });
     const context = await chromiumExtra.launchPersistentContext(PROFILE_DIR, {
-      headless: true,
+      headless: !wantHeadful,
       args: launchArgs,
       viewport: { width: 1440, height: 900 },
       userAgent,
