@@ -116,106 +116,256 @@ export async function getAirbnbReservations(days = 30) {
   return _airbnbSerialize(() => _autoRefreshOnExpiry(() => _getAirbnbReservations(days)));
 }
 async function _getAirbnbReservations(days = 30) {
+  resetAirbnbDiag();
+  airbnbLog('getAirbnbReservations', { days });
   const { browser, page } = await getBrowserPage();
   try {
-    // Intercept API responses — the reservations list fires a GraphQL/REST call
-    // that includes full guest breakdown (adults/children/infants) in JSON.
-    const apiReservations = new Map(); // confirmationCode → guestData
+    // Broad API capture — Airbnb removed the /hosting/reservations table; everything
+    // now loads through the /hosting dashboard. The endpoint names changed too,
+    // so filter by content instead of URL keyword.
+    const apiReservations = new Map(); // confirmationCode → full reservation object
+    const capturedEndpoints = [];
     page.on('response', async (response) => {
       const ct = response.headers()['content-type'] ?? '';
       if (!ct.includes('json')) return;
       const url = response.url();
-      if (!/reserv|booking|guest|stays/i.test(url)) return;
+      if (/locale|translation|i18n|manifest|\.js|\.css|static|chunk|font/i.test(url)) return;
       try {
         const json = await response.json();
         const str  = JSON.stringify(json);
-        if (!/adults|children|infants|numGuests|guest_count/i.test(str)) return;
-        // Walk the response looking for reservation objects that have a
-        // confirmation_code and guest count fields.
-        const walk = (node) => {
-          if (!node || typeof node !== 'object') return;
-          if (Array.isArray(node)) { node.forEach(walk); return; }
-          const code = node.confirmation_code ?? node.confirmationCode ?? node.code;
-          const adults   = node.adults   ?? node.num_adults   ?? node.adultCount   ?? 0;
-          const children = node.children ?? node.num_children ?? node.childrenCount ?? 0;
-          const infants  = node.infants  ?? node.num_infants  ?? node.infantCount   ?? 0;
-          const pets     = node.pets     ?? node.num_pets     ?? node.petCount      ?? 0;
-          const total    = node.guest_count ?? node.numGuests ?? node.guestsCount
-                           ?? node.number_of_guests ?? ((adults + children + infants) || null);
-          if (code && total) {
-            apiReservations.set(String(code), { adults, children, infants, pets, total });
+        if (!/confirm|reservation|checkin|checkout|guest|booking/i.test(str)) return;
+        capturedEndpoints.push(url.replace(/\?.*/, '').slice(-80));
+
+        const walk = (node, depth = 0) => {
+          if (!node || typeof node !== 'object' || depth > 12) return;
+          if (Array.isArray(node)) { node.forEach(n => walk(n, depth + 1)); return; }
+          const code = node.confirmation_code ?? node.confirmationCode ?? node.reservationCode;
+          if (code && typeof code === 'string' && code.length >= 6 && !apiReservations.has(code)) {
+            const adults   = node.adults   ?? node.num_adults   ?? node.adultCount   ?? 0;
+            const children = node.children ?? node.num_children ?? node.childrenCount ?? 0;
+            const infants  = node.infants  ?? node.num_infants  ?? node.infantCount   ?? 0;
+            const pets     = node.pets     ?? node.num_pets     ?? node.petCount      ?? 0;
+            const total    = node.guest_count ?? node.numGuests ?? node.guestsCount
+                             ?? node.number_of_guests ?? ((adults + children + infants) || null);
+            apiReservations.set(code, {
+              confirmationCode: code,
+              guest:    node.guest_name ?? node.guestName ?? node.guest?.name ?? node.booker_name ?? '',
+              checkin:  node.checkin  ?? node.check_in  ?? node.checkin_date  ?? node.arrival_date   ?? '',
+              checkout: node.checkout ?? node.check_out ?? node.checkout_date ?? node.departure_date ?? '',
+              status:   node.status   ?? node.reservation_status ?? node.state ?? '',
+              total:    node.total_price != null ? String(node.total_price) : (node.amount != null ? String(node.amount) : ''),
+              guests:   total ?? null,
+              adults, children, infants, pets,
+              listing:  node.listing_name ?? node.listing?.name ?? node.property_name ?? '',
+            });
           }
-          Object.values(node).forEach(walk);
+          Object.values(node).forEach(v => walk(v, depth + 1));
         };
         walk(json);
       } catch { /* ignore */ }
     });
 
-    // domcontentloaded is enough — Airbnb keeps background XHRs alive indefinitely
-    // so networkidle never fires. The explicit waitForSelector below gates on actual data.
-    await page.goto('https://www.airbnb.com/hosting/reservations', { waitUntil: 'domcontentloaded', timeout: 45_000 });
-    assertAirbnbNotLoginPage(page.url());
+    // /hosting/reservations/* all redirect to /hosting — navigate there directly.
+    await page.goto('https://www.airbnb.com/hosting', { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    const landedUrl = page.url();
+    airbnbLog('hosting nav', { landed: landedUrl });
+    assertAirbnbNotLoginPage(landedUrl);
 
-    try {
-      await page.waitForSelector('[data-testid="host-reservations-table-row"]', { timeout: 25_000 });
-    } catch { /* no rows */ }
+    // Wait up to 15s for Upcoming section dates to appear without clicking anything.
+    // The section renders asynchronously after initial page load.
+    // Browser-serializable predicate (must not reference outer Node.js variables).
+    const hasDates = () => /(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d/.test(document.body?.innerText ?? '');
+    const datesAlready = await page.evaluate(hasDates);
+    if (!datesAlready) {
+      // Try clicking the Upcoming section tab (not nav links — those redirect away).
+      // The section tabs sit inside the main content area, not the side nav.
+      try {
+        // Use role=tab or a button/heading inside main that says "Upcoming".
+        // Avoid <a href> elements — those are nav links that redirect.
+        const upcomingTab = page.locator(
+          'main button:has-text("Upcoming"), [role="tab"]:has-text("Upcoming"), [role="tablist"] :has-text("Upcoming")'
+        ).first();
+        if (await upcomingTab.count()) {
+          await upcomingTab.click({ timeout: 4_000 });
+          airbnbLog('clicked Upcoming section tab');
+        } else {
+          airbnbLog('Upcoming tab not found in main — waiting for auto-render');
+        }
+      } catch (e) { airbnbLog('Upcoming tab click failed', { msg: e?.message }); }
 
-    const rows = await page.evaluate(() => {
-      const rows = document.querySelectorAll('[data-testid="host-reservations-table-row"]');
-      return Array.from(rows).map(row => {
-        const cells    = row.querySelectorAll('td');
-        const guestLines = (cells[1]?.innerText ?? '').split('\n').map(l => l.trim()).filter(Boolean);
-        const rowText  = row.innerText ?? '';
+      // Wait for dates to appear (up to 15s).
+      try {
+        await page.waitForFunction(
+          () => /(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d/.test(document.body?.innerText ?? ''),
+          { timeout: 15_000 }
+        );
+        airbnbLog('reservation dates appeared in DOM');
+      } catch { airbnbLog('waitForFunction timeout — reading body anyway'); }
+    } else {
+      airbnbLog('reservation dates already in DOM on load');
+    }
+    airbnbLog('api capture', { endpointCount: capturedEndpoints.length, reservationCount: apiReservations.size });
 
-        // DOM fallback: parse whatever text Airbnb renders in the row.
-        const pick = (pat) => { const m = rowText.match(pat); return m ? parseInt(m[1], 10) : 0; };
-        const adults   = pick(/(\d+)\s+adult/i);
-        const children = pick(/(\d+)\s+child(?:ren)?/i);
-        const infants  = pick(/(\d+)\s+infant/i);
-        const pets     = pick(/(\d+)\s+pet/i);
-        const typesTotal   = adults + children + infants;
-        const guestsLabel  = pick(/(\d+)\s+guest/i);
-        const domGuests    = typesTotal > 0 ? typesTotal : (guestsLabel || 1);
-        const domBreakdown = {
-          ...(adults   > 0 && { adults }),
-          ...(children > 0 && { children }),
-          ...(infants  > 0 && { infants }),
-          ...(pets     > 0 && { pets }),
-        };
+    // Scroll + click "Show more" to load all upcoming reservations.
+    for (let i = 0; i < 10; i++) {
+      try {
+        const more = page.locator('button:has-text("Show more"), a:has-text("Show more")').first();
+        if (await more.count()) { await more.click({ timeout: 3_000 }); await page.waitForTimeout(1_200); }
+        else break;
+      } catch { break; }
+    }
 
-        return {
-          status:           cells[0]?.innerText?.trim() ?? '',
-          guest:            guestLines[0] ?? '',
-          _domGuests:       domGuests,
-          _domBreakdown:    domBreakdown,
-          _rawGuestCell:    cells[1]?.innerText?.trim() ?? '',
-          phone:            cells[2]?.innerText?.trim() ?? '',
-          checkin:          cells[3]?.innerText?.trim() ?? '',
-          checkout:         cells[4]?.innerText?.trim() ?? '',
-          booked:           cells[5]?.innerText?.split('\n')[0].trim() ?? '',
-          listing:          cells[6]?.innerText?.trim() ?? '',
-          confirmationCode: cells[7]?.innerText?.trim() ?? '',
-          total:            cells[8]?.innerText?.trim() ?? '',
-        };
-      });
+    // ── Strategy 1: __NEXT_DATA__ (SSR-embedded full reservation objects) ──
+    // Airbnb hosting is a Next.js app; the initial page props (including full
+    // reservation lists) are embedded as JSON in a <script id="__NEXT_DATA__"> tag.
+    // This avoids needing to intercept XHR since the data is already in the DOM.
+    if (apiReservations.size === 0) {
+      const nextDataJson = await page.evaluate(() => document.getElementById('__NEXT_DATA__')?.textContent ?? '');
+      if (nextDataJson) {
+        try {
+          const nextData = JSON.parse(nextDataJson);
+          const walk = (node, depth = 0) => {
+            if (!node || typeof node !== 'object' || depth > 20) return;
+            if (Array.isArray(node)) { node.forEach(n => walk(n, depth + 1)); return; }
+            const code = node.confirmation_code ?? node.confirmationCode ?? node.reservationCode;
+            if (code && typeof code === 'string' && code.length >= 6 && !apiReservations.has(code)) {
+              const adults   = node.adults   ?? node.num_adults   ?? node.adultCount   ?? 0;
+              const children = node.children ?? node.num_children ?? node.childrenCount ?? 0;
+              const infants  = node.infants  ?? node.num_infants  ?? node.infantCount   ?? 0;
+              const pets     = node.pets     ?? node.num_pets     ?? node.petCount      ?? 0;
+              const total    = node.guest_count ?? node.numGuests ?? node.guestsCount
+                               ?? node.number_of_guests ?? ((adults + children + infants) || null);
+              apiReservations.set(code, {
+                confirmationCode: code,
+                guest:    node.guest_name ?? node.guestName ?? node.guest?.name ?? '',
+                checkin:  node.checkin  ?? node.check_in  ?? node.checkin_date  ?? node.arrival_date   ?? '',
+                checkout: node.checkout ?? node.check_out ?? node.checkout_date ?? node.departure_date ?? '',
+                status:   node.status   ?? node.reservation_status ?? node.state ?? '',
+                total:    node.total_price != null ? String(node.total_price) : '',
+                guests:   total ?? null,
+                adults, children, infants, pets,
+                listing:  node.listing_name ?? node.listing?.name ?? '',
+              });
+            }
+            Object.values(node).forEach(v => walk(v, depth + 1));
+          };
+          walk(nextData);
+          airbnbLog('__NEXT_DATA__ parse', { reservationCount: apiReservations.size });
+        } catch (e) { airbnbLog('__NEXT_DATA__ parse failed', { msg: e?.message }); }
+      }
+    }
+
+    if (apiReservations.size > 0) {
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() + days);
+      const now = new Date();
+      const result = [...apiReservations.values()]
+        .filter(r => {
+          if (!r.checkout) return true;
+          const co = new Date(r.checkout);
+          return !isNaN(co) && co >= now && co <= cutoff;
+        })
+        .map(r => ({
+          confirmationCode: r.confirmationCode,
+          guest:            r.guest,
+          checkin:          r.checkin,
+          checkout:         r.checkout,
+          status:           r.status,
+          total:            r.total,
+          listing:          r.listing,
+          guests:           r.guests ?? null,
+          guestBreakdown:   Object.fromEntries(
+            [['adults', r.adults], ['children', r.children], ['infants', r.infants], ['pets', r.pets]]
+              .filter(([, v]) => v > 0)
+          ),
+        }));
+      airbnbLog('returning reservations from __NEXT_DATA__/XHR', { total: apiReservations.size, filtered: result.length });
+      airbnbDiagInfo('get_airbnb_reservations');
+      return result;
+    }
+
+    // ── Strategy 2: Body-text card parser ────────────────────────────────────
+    // The Upcoming section renders reservation cards as plain text in a predictable
+    // pattern: date-range line → optional "+N" → "N other" → "Guest's group of N".
+    // No confirmation codes, but enough for the calendar (checkin/checkout/guests).
+    const bodyText = await page.evaluate(() => document.body?.innerText ?? '');
+    // Log raw unicode codepoints of first date-like line for debugging
+    const firstDateLine = bodyText.split('\n').find(l => /Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec/.test(l));
+    airbnbLog('body-text fallback', {
+      bodyLen: bodyText.length,
+      firstDateLine: firstDateLine ?? '(none)',
+      firstDateLineCodepoints: firstDateLine ? [...firstDateLine].slice(0, 30).map(c => c.codePointAt(0).toString(16)).join(' ') : null,
     });
 
-    // Merge API guest data (authoritative) over DOM fallback.
-    return rows.map(row => {
-      const api = apiReservations.get(row.confirmationCode);
-      const guests = api?.total ?? row._domGuests;
-      const guestBreakdown = api
-        ? {
-            ...(api.adults   > 0 && { adults:   api.adults }),
-            ...(api.children > 0 && { children: api.children }),
-            ...(api.infants  > 0 && { infants:  api.infants }),
-            ...(api.pets     > 0 && { pets:     api.pets }),
-          }
-        : row._domBreakdown;
-      const { _domGuests, _domBreakdown, _rawGuestCell, ...rest } = row;
-      return { ...rest, guests, guestBreakdown, _rawGuestCell };
-    });
+    const MONTH = 'Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec';
+    // Match "Sep 7 — 10" or "Oct 28 — Nov 1" (thin-space   before/after em-dash)
+    const DATE_RANGE_RE = new RegExp(
+      `^(${MONTH})[\\s ]+(\\d{1,2})[\\s ]*[—–—–-][\\s ]*(?:(${MONTH})[\\s ]+)?(\\d{1,2})$`
+    );
+    // Match "Kathy's group of 2" — apostrophe may be curly ’ or straight '
+    const GUEST_RE = /^(.+?)[’']s\s+group\s+of\s+(\d+)$/i;
+    // "Show more" line ends the visible list
+    const STOP_RE = /^show more$/i;
+
+    const lines = bodyText.split('\n').map(l => l.trim()).filter(Boolean);
+    // Find "Upcoming" header then parse until "Show more" or page footer
+    const upcomingIdx = lines.findIndex(l => /^Upcoming$/i.test(l));
+    const slice = upcomingIdx >= 0 ? lines.slice(upcomingIdx + 1) : lines;
+
+    const textReservations = [];
+    let pendingDate = null;
+    const currentYear = new Date().getFullYear();
+    for (const line of slice) {
+      if (STOP_RE.test(line)) break;
+      if (/^(Site Footer|Support|Help Center)/i.test(line)) break;
+
+      const dateM = DATE_RANGE_RE.exec(line);
+      if (dateM) {
+        // dateM[1]=startMonth, [2]=startDay, [3]=endMonth(optional), [4]=endDay
+        const startMonth = dateM[1];
+        const startDay   = dateM[2];
+        const endMonth   = dateM[3] ?? startMonth;
+        const endDay     = dateM[4];
+        const today = new Date(); today.setHours(0, 0, 0, 0);
+        let   ci  = new Date(`${startMonth} ${startDay}, ${currentYear}`);
+        let   co  = new Date(`${endMonth} ${endDay}, ${currentYear}`);
+        // All Upcoming reservations are in the future — if checkout < today, bump year.
+        if (!isNaN(co) && co < today) {
+          ci.setFullYear(ci.getFullYear() + 1);
+          co.setFullYear(co.getFullYear() + 1);
+        }
+        // Handle cross-month ranges within same slot (e.g. Oct 28 → Nov 1 → checkout before checkin)
+        if (!isNaN(ci) && !isNaN(co) && co < ci) co.setFullYear(co.getFullYear() + 1);
+        pendingDate = { checkin: isNaN(ci) ? `${startMonth} ${startDay}, ${currentYear}` : ci.toISOString().slice(0, 10),
+                        checkout: isNaN(co) ? `${endMonth} ${endDay}, ${currentYear}` : co.toISOString().slice(0, 10) };
+        continue;
+      }
+      if (!pendingDate) continue;
+
+      const guestM = GUEST_RE.exec(line);
+      if (guestM) {
+        textReservations.push({
+          confirmationCode: '',
+          guest:    guestM[1].trim(),
+          checkin:  pendingDate.checkin,
+          checkout: pendingDate.checkout,
+          status:   'confirmed',
+          total:    '',
+          listing:  '',
+          guests:   parseInt(guestM[2], 10),
+          guestBreakdown: {},
+        });
+        pendingDate = null;
+      }
+    }
+
+    airbnbLog('body-text parse result', { count: textReservations.length });
+    airbnbDiagInfo('get_airbnb_reservations');
+    return textReservations;
+  } catch (err) {
+    throw airbnbDiagError(err);
   } finally {
+    airbnbDiagInfo('get_airbnb_reservations');
     await browser.close();
   }
 }
