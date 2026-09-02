@@ -332,6 +332,106 @@ export async function saveBookingSession({ timeoutMs = 10 * 60 * 1000, log = nul
   const page = context.pages()[0] ?? (await context.newPage());
   await page.goto(loginUrl);
 
+  // ── Auto-fill from .env (visible browser is safe from bot detection) ──
+  // If BOOKING_EMAIL + BOOKING_PASSWORD are in .env, silently type them into
+  // the login form and click through. User only needs to touch the browser
+  // for OTP / CAPTCHA / auth-assurance. If auto-fill fails at any step, we
+  // just leave the browser open and let the user type it in manually.
+  const envCreds = loadEnv();
+  if (envCreds.BOOKING_EMAIL && envCreds.BOOKING_PASSWORD) {
+    // Fire and forget — the polling loop below still handles success detection
+    // regardless of whether this succeeds.
+    (async () => {
+      try {
+        // Wait for Booking to redirect from admin.booking.com → account.booking.com/sign-in
+        await page.waitForTimeout(2000);
+
+        const EMAIL_SELECTORS = [
+          'input[data-testid*="username" i]',
+          'input[data-testid*="email" i]',
+          'input[name="username"]',
+          'input[name="loginname"]',
+          'input[name="email"]',
+          'input[type="email"]',
+        ];
+        const PASSWORD_SELECTORS = [
+          'input[data-testid*="password" i]',
+          'input[name="password"]',
+          'input[type="password"]',
+        ];
+        const SUBMIT_SELECTORS = [
+          'button[type="submit"]:not([disabled])',
+          'button:has-text("Continue")',
+          'button:has-text("Sign in")',
+          'button:has-text("Log in")',
+        ];
+        const waitAny = async (sels, timeout) => {
+          const start = Date.now();
+          while (Date.now() - start < timeout) {
+            for (const s of sels) {
+              const el = await page.$(s).catch(() => null);
+              if (el && (await el.isVisible().catch(() => false))) return { el, sel: s };
+            }
+            await page.waitForTimeout(400);
+          }
+          return null;
+        };
+
+        const emailHit = await waitAny(EMAIL_SELECTORS, 12_000);
+        if (!emailHit) { emit('auto-fill: email field not found — user can type manually'); return; }
+        emit(`auto-fill: typing email into ${emailHit.sel}`);
+        await emailHit.el.fill(envCreds.BOOKING_EMAIL);
+
+        const continueHit = await waitAny(SUBMIT_SELECTORS, 3_000);
+        if (continueHit) { emit('auto-fill: clicking Continue'); await continueHit.el.click(); }
+
+        // Booking sometimes shows an intermediate "how do you want to sign in"
+        // page: pick between "Sign in with password" and "Get email code".
+        // Look for the password option and click it if present. If not, we're
+        // already on the password page and this is a no-op.
+        await page.waitForTimeout(1500);
+        const PASSWORD_OPTION_SELECTORS = [
+          'button[data-testid*="password" i]:not([type="submit"])',
+          'a[data-testid*="password" i]',
+          'button:has-text("Sign in with a password")',
+          'button:has-text("Sign in with password")',
+          'button:has-text("Use password")',
+          'a:has-text("Sign in with password")',
+          'a:has-text("Use password")',
+          '[role="button"]:has-text("password")',
+        ];
+        // Only click if there's NO visible password input yet — avoids clicking
+        // a stray element on the actual password page.
+        const alreadyOnPasswordPage = await page.$('input[type="password"]:visible, input[name="password"]').catch(() => null);
+        if (!alreadyOnPasswordPage) {
+          const pwOpt = await waitAny(PASSWORD_OPTION_SELECTORS, 3_000);
+          if (pwOpt) {
+            emit(`auto-fill: clicking "Sign in with password" option (${pwOpt.sel})`);
+            await pwOpt.el.click();
+            await page.waitForTimeout(1000);
+          } else {
+            emit('auto-fill: no password-option button found, waiting directly for password field');
+          }
+        }
+
+        const passHit = await waitAny(PASSWORD_SELECTORS, 15_000);
+        if (!passHit) {
+          emit('auto-fill: password field not appearing — user can proceed manually. Current URL: ' + page.url());
+          return;
+        }
+        emit(`auto-fill: typing password into ${passHit.sel}`);
+        await passHit.el.fill(envCreds.BOOKING_PASSWORD);
+
+        const signHit = await waitAny(SUBMIT_SELECTORS, 3_000);
+        if (signHit) { emit('auto-fill: clicking Sign in'); await signHit.el.click(); }
+        // From here, OTP / CAPTCHA / trust-device may appear — user handles.
+        // The polling loop below picks up whenever the URL lands on /hotel/.
+      } catch (e) {
+        emit(`auto-fill: hit an error, falling back to manual — ${e.message}`);
+      }
+    })();
+  }
+
   emit('');
   emit('Log in with your Booking.com partner credentials, complete any 2FA,');
   emit('select your property if prompted, and open the reservations list.');
