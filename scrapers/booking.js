@@ -60,7 +60,13 @@ function getSavedUrls() {
 }
 
 function fmtDate(d) {
-  return d.toISOString().slice(0, 10);
+  // LOCAL date components — toISOString() converts to UTC, which for
+  // timezones ahead of UTC (like BST) rolls midnight back into the previous
+  // day. Not corrupting for filter URL windows but keeps the range accurate.
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
 }
 
 function withDateRange(baseUrl, days) {

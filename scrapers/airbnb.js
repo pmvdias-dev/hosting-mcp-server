@@ -106,6 +106,44 @@ async function getBrowserPage() {
   return { browser, page };
 }
 
+// Extract a display-ready price from an Airbnb JSON node. Airbnb uses many
+// field names for booking totals — formatted strings, {amount,currency} objs,
+// and plain numeric fields. Returns "£123.45"-style string or "" if none.
+function pickAirbnbPrice(n) {
+  if (!n || typeof n !== 'object') return '';
+  const strFields = [
+    'total_paid_amount_formatted', 'earnings_amount_formatted',
+    'total_price_formatted', 'host_payout_formatted', 'payout_amount_formatted',
+    'guest_total_price_formatted', 'formatted_total',
+  ];
+  for (const f of strFields) if (typeof n[f] === 'string' && n[f].trim()) return n[f];
+  const objFields = [
+    'total_paid_amount_accurate', 'earnings_amount_accurate',
+    'total_price_accurate', 'payout_price_accurate', 'host_payout_accurate',
+    'guest_total_accurate',
+  ];
+  for (const f of objFields) {
+    const v = n[f];
+    if (v && typeof v === 'object' && v.amount != null) {
+      const cur = v.currency || v.currencyCode || 'GBP';
+      const sym = cur === 'GBP' ? '£' : cur === 'USD' ? '$' : cur === 'EUR' ? '€' : (cur + ' ');
+      return sym + Number(v.amount).toFixed(2);
+    }
+  }
+  const numFields = [
+    'total_price', 'amount', 'total', 'earnings_amount', 'host_payout_amount',
+    'payout_amount', 'guest_total_price', 'booking_total',
+  ];
+  for (const f of numFields) {
+    const v = n[f];
+    if (v != null && (typeof v === 'number' || (typeof v === 'string' && v.trim()))) {
+      const num = Number(String(v).replace(/[^\d.-]/g, ''));
+      if (Number.isFinite(num)) return '£' + num.toFixed(2);
+    }
+  }
+  return '';
+}
+
 function assertAirbnbNotLoginPage(url) {
   if (url.includes('/login') || url.includes('/signup') || !url.includes('airbnb.com')) {
     throw new Error(`Airbnb session expired (redirected to: ${url}). Run: node save-session.js airbnb (or call the refresh_airbnb_session MCP tool)`);
@@ -153,7 +191,7 @@ async function _getAirbnbReservations(days = 30) {
               checkin:  node.checkin  ?? node.check_in  ?? node.checkin_date  ?? node.arrival_date   ?? '',
               checkout: node.checkout ?? node.check_out ?? node.checkout_date ?? node.departure_date ?? '',
               status:   node.status   ?? node.reservation_status ?? node.state ?? '',
-              total:    node.total_price != null ? String(node.total_price) : (node.amount != null ? String(node.amount) : ''),
+              total:    pickAirbnbPrice(node),
               guests:   total ?? null,
               adults, children, infants, pets,
               listing:  node.listing_name ?? node.listing?.name ?? node.property_name ?? '',
@@ -241,7 +279,7 @@ async function _getAirbnbReservations(days = 30) {
                 checkin:  node.checkin  ?? node.check_in  ?? node.checkin_date  ?? node.arrival_date   ?? '',
                 checkout: node.checkout ?? node.check_out ?? node.checkout_date ?? node.departure_date ?? '',
                 status:   node.status   ?? node.reservation_status ?? node.state ?? '',
-                total:    node.total_price != null ? String(node.total_price) : '',
+                total:    pickAirbnbPrice(node),
                 guests:   total ?? null,
                 adults, children, infants, pets,
                 listing:  node.listing_name ?? node.listing?.name ?? '',
@@ -336,8 +374,17 @@ async function _getAirbnbReservations(days = 30) {
         }
         // Handle cross-month ranges within same slot (e.g. Oct 28 → Nov 1 → checkout before checkin)
         if (!isNaN(ci) && !isNaN(co) && co < ci) co.setFullYear(co.getFullYear() + 1);
-        pendingDate = { checkin: isNaN(ci) ? `${startMonth} ${startDay}, ${currentYear}` : ci.toISOString().slice(0, 10),
-                        checkout: isNaN(co) ? `${endMonth} ${endDay}, ${currentYear}` : co.toISOString().slice(0, 10) };
+        // Use LOCAL date components — toISOString() converts to UTC which,
+        // for timezones ahead of UTC (like BST/CEST), shifts local midnight
+        // back into the previous calendar day. Bug: "Sep 7" became "2026-09-06".
+        const toLocalYmd = (d) => {
+          const y = d.getFullYear();
+          const m = String(d.getMonth() + 1).padStart(2, '0');
+          const dd = String(d.getDate()).padStart(2, '0');
+          return `${y}-${m}-${dd}`;
+        };
+        pendingDate = { checkin: isNaN(ci) ? `${startMonth} ${startDay}, ${currentYear}` : toLocalYmd(ci),
+                        checkout: isNaN(co) ? `${endMonth} ${endDay}, ${currentYear}` : toLocalYmd(co) };
         continue;
       }
       if (!pendingDate) continue;
