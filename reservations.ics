@@ -22,4 +22,103 @@ TZOFFSETTO:+0100
 TZNAME:BST
 END:DAYLIGHT
 END:VTIMEZONE
+BEGIN:VEVENT
+UID:cleaning-2026-10-17@belfast-str
+DTSTAMP:20261005T104349Z
+DTSTART;TZID=Europe/London:20261017T110000
+DTEND;TZID=Europe/London:20261017T150000
+SUMMARY:Cleaning — 3 guests (Airbnb)
+DESCRIPTION:Number of guests: 3\nCheck-in:  2026-10-14\nCheck-out: 2026-10-
+ 17\nPlatform: Airbnb
+LOCATION:Central & Cosy — Belfast
+STATUS:CONFIRMED
+END:VEVENT
+BEGIN:VEVENT
+UID:cleaning-2026-10-21@belfast-str
+DTSTAMP:20261005T104349Z
+DTSTART;TZID=Europe/London:20261021T110000
+DTEND;TZID=Europe/London:20261021T150000
+SUMMARY:Cleaning — 2 guests (Airbnb)
+DESCRIPTION:Number of guests: 2\nCheck-in:  2026-10-19\nCheck-out: 2026-10-
+ 21\nPlatform: Airbnb
+LOCATION:Central & Cosy — Belfast
+STATUS:CONFIRMED
+END:VEVENT
+BEGIN:VEVENT
+UID:cleaning-2026-11-01@belfast-str
+DTSTAMP:20261005T104349Z
+DTSTART;TZID=Europe/London:20261101T110000
+DTEND;TZID=Europe/London:20261101T150000
+SUMMARY:Cleaning — 2 guests (Airbnb)
+DESCRIPTION:Number of guests: 2\nCheck-in:  2026-10-28\nCheck-out: 2026-11-
+ 01\nPlatform: Airbnb
+LOCATION:Central & Cosy — Belfast
+STATUS:CONFIRMED
+END:VEVENT
+BEGIN:VEVENT
+UID:cleaning-2026-11-08@belfast-str
+DTSTAMP:20261005T104349Z
+DTSTART;TZID=Europe/London:20261108T110000
+DTEND;TZID=Europe/London:20261108T150000
+SUMMARY:Cleaning — 2 guests (Airbnb)
+DESCRIPTION:Number of guests: 2\nCheck-in:  2026-11-06\nCheck-out: 2026-11-
+ 08\nPlatform: Airbnb
+LOCATION:Central & Cosy — Belfast
+STATUS:CONFIRMED
+END:VEVENT
+BEGIN:VEVENT
+UID:cleaning-2026-11-12@belfast-str
+DTSTAMP:20261005T104349Z
+DTSTART;TZID=Europe/London:20261112T110000
+DTEND;TZID=Europe/London:20261112T150000
+SUMMARY:Cleaning — 2 guests (Airbnb)
+DESCRIPTION:Number of guests: 2\nCheck-in:  2026-11-09\nCheck-out: 2026-11-
+ 12\nPlatform: Airbnb
+LOCATION:Central & Cosy — Belfast
+STATUS:CONFIRMED
+END:VEVENT
+BEGIN:VEVENT
+UID:cleaning-2027-02-07@belfast-str
+DTSTAMP:20261005T104349Z
+DTSTART;TZID=Europe/London:20270207T110000
+DTEND;TZID=Europe/London:20270207T150000
+SUMMARY:Cleaning — 2 guests (Airbnb)
+DESCRIPTION:Number of guests: 2\nCheck-in:  2027-02-05\nCheck-out: 2027-02-
+ 07\nPlatform: Airbnb
+LOCATION:Central & Cosy — Belfast
+STATUS:CONFIRMED
+END:VEVENT
+BEGIN:VEVENT
+UID:cleaning-2027-02-24@belfast-str
+DTSTAMP:20261005T104349Z
+DTSTART;TZID=Europe/London:20270224T110000
+DTEND;TZID=Europe/London:20270224T150000
+SUMMARY:Cleaning — 2 guests (Airbnb)
+DESCRIPTION:Number of guests: 2\nCheck-in:  2027-02-21\nCheck-out: 2027-02-
+ 24\nPlatform: Airbnb
+LOCATION:Central & Cosy — Belfast
+STATUS:CONFIRMED
+END:VEVENT
+BEGIN:VEVENT
+UID:cleaning-2027-03-12@belfast-str
+DTSTAMP:20261005T104349Z
+DTSTART;TZID=Europe/London:20270312T110000
+DTEND;TZID=Europe/London:20270312T150000
+SUMMARY:Cleaning — 3 guests (Airbnb)
+DESCRIPTION:Number of guests: 3\nCheck-in:  2027-03-09\nCheck-out: 2027-03-
+ 12\nPlatform: Airbnb
+LOCATION:Central & Cosy — Belfast
+STATUS:CONFIRMED
+END:VEVENT
+BEGIN:VEVENT
+UID:cleaning-2027-05-05@belfast-str
+DTSTAMP:20261005T104349Z
+DTSTART;TZID=Europe/London:20270505T110000
+DTEND;TZID=Europe/London:20270505T150000
+SUMMARY:Cleaning — 2 guests (Airbnb)
+DESCRIPTION:Number of guests: 2\nCheck-in:  2027-05-03\nCheck-out: 2027-05-
+ 05\nPlatform: Airbnb
+LOCATION:Central & Cosy — Belfast
+STATUS:CONFIRMED
+END:VEVENT
 END:VCALENDAR
