@@ -28,9 +28,16 @@ function log(level, toolName, message, extra) {
 // then calls the same scrapers again to build the .ics. Without caching,
 // each Reload double-scrapes both Airbnb + Booking. With a short TTL cache
 // keyed by (fn, args), back-to-back calls in the same Reload reuse the
-// result. Cache is invalidated by process restart or TTL expiry — always
-// safe (worst case we serve slightly stale data for 60s).
-const SCRAPER_CACHE_TTL_MS = 60_000;
+// result. Cache is invalidated by process restart or TTL expiry.
+//
+// TTL = 10 minutes — bumped from 60s because the Booking scrape itself now
+// takes ~60s (back-nav calendar + pagination). With TTL=60s and timestamp
+// set at call START, the cache entry would already be expired by the time
+// the first scrape finishes, so follow-up calls (e.g., regenerate_cleaner_calendar
+// after boot) always miss. We also RESET the timestamp when the promise
+// resolves, so TTL counts from completion — a chain of consumers right after
+// a successful scrape all hit cache.
+const SCRAPER_CACHE_TTL_MS = 10 * 60 * 1000;
 const _scraperCache = new Map(); // key → { at, promise }
 async function memoize(fnName, args, fn) {
   const key = fnName + ':' + JSON.stringify(args ?? {});
@@ -41,9 +48,15 @@ async function memoize(fnName, args, fn) {
     return hit.promise;
   }
   const promise = fn();
-  _scraperCache.set(key, { at: now, promise });
-  // If it rejects, evict so a future retry actually re-runs
-  promise.catch(() => _scraperCache.delete(key));
+  const entry = { at: now, promise };
+  _scraperCache.set(key, entry);
+  // Reset timestamp on resolution so TTL counts from completion, not from
+  // call start — critical for scrapes that approach or exceed the TTL in
+  // duration (Booking back-nav + pagination ~60s).
+  promise.then(
+    () => { entry.at = Date.now(); },
+    () => { _scraperCache.delete(key); } // on reject, evict so retries actually re-run
+  );
   return promise;
 }
 
@@ -250,16 +263,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'get_earnings_summary': {
         const year  = args?.year  ?? null;
         const month = args?.month ?? null;
-        result = await memoize('get_earnings_summary', { year, month }, async () => {
-          const [airbnbResult, bookingResult] = await Promise.allSettled([
-            getAirbnbEarnings({ year, month }),
-            getBookingEarnings({ year, month }),
-          ]);
-          const airbnb  = airbnbResult.status  === 'fulfilled' ? airbnbResult.value  : null;
-          const booking = bookingResult.status === 'fulfilled' ? bookingResult.value : null;
+        // Booking side is intentionally skipped — payouts page added ~15s and
+        // a visible browser window per Reload, but its monthly totals are
+        // already derivable from get_booking_reservations (gross reservation
+        // total summed by check-in month). Caller can opt-in to Booking
+        // earnings by passing { includeBooking: true } if ever needed.
+        const includeBooking = args?.includeBooking === true;
+        result = await memoize('get_earnings_summary', { year, month, includeBooking }, async () => {
+          const tasks = [getAirbnbEarnings({ year, month })];
+          if (includeBooking) tasks.push(getBookingEarnings({ year, month }));
+          const settled = await Promise.allSettled(tasks);
+          const airbnb  = settled[0].status === 'fulfilled' ? settled[0].value : null;
+          const booking = includeBooking
+            ? (settled[1].status === 'fulfilled' ? settled[1].value : null)
+            : null;
           const errors  = [];
-          if (airbnbResult.status  === 'rejected') errors.push(`Airbnb: ${airbnbResult.reason?.message}`);
-          if (bookingResult.status === 'rejected') errors.push(`Booking.com: ${bookingResult.reason?.message}`);
+          if (settled[0].status === 'rejected') errors.push(`Airbnb: ${settled[0].reason?.message}`);
+          if (includeBooking && settled[1].status === 'rejected') errors.push(`Booking.com: ${settled[1].reason?.message}`);
           return {
             period: { year: year ?? new Date().getFullYear(), month: month ?? null },
             airbnb,

@@ -203,11 +203,291 @@ async function _getAirbnbReservations(days = 30) {
       } catch { /* ignore */ }
     });
 
-    // /hosting/reservations/* all redirect to /hosting — navigate there directly.
-    await page.goto('https://www.airbnb.com/hosting', { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    // Primary source: /hosting/reservations/upcoming on the UK locale. This
+    // page renders a proper HTML table with status, guest name, check-in,
+    // check-out, booking date, listing, confirmation code and total payout —
+    // everything we need in one place. Includes "Currently hosting" guests
+    // (today's active reservation) plus upcoming ones. Falls back below to
+    // the old /hosting flow if the table isn't found.
+    // Use the "All" tab so we get past (Completed) + current + future
+    // reservations in one table — needed so the YTD monthly chart has
+    // past-month data points to render Airbnb bars. .com host because our
+    // session cookies are bound to that domain. Date-range URL params
+    // narrow the server-side query so the lazy-load scroll has less work.
+    const nowY = new Date().getFullYear();
+    const startQ = `${nowY - 1}-01-01`;      // Jan last year
+    const endQ   = `${nowY + 1}-12-31`;      // Dec next year
+    const allUrl = `https://www.airbnb.com/hosting/reservations/all?startDate=${startQ}&endDate=${endQ}`;
+    await page.goto(allUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 });
     const landedUrl = page.url();
-    airbnbLog('hosting nav', { landed: landedUrl });
+    airbnbLog('reservations/upcoming nav', { landed: landedUrl });
     assertAirbnbNotLoginPage(landedUrl);
+
+    // Wait up to 15s for the table to render.
+    const tableAppeared = await page.waitForSelector('table tbody tr, [role="rowgroup"] [role="row"]', { timeout: 15_000 })
+      .then(() => true).catch(() => false);
+    airbnbLog('upcoming table wait', { tableAppeared });
+
+    if (tableAppeared) {
+      // The /all table is paginated — numbered page buttons at the bottom
+      // ("1 2 3 >"). Walk forward one page at a time, accumulating rows across
+      // pages. We extract rows from each page and the final merge happens below
+      // (page 1's rows have already been captured; we re-read on each loop
+      // because switching pages replaces the table body).
+      const accumulated = [];
+      const MAX_PAGES = 25;        // safety cap — supports ~500 reservations at 20/page
+      const PAGE_WAIT_MS = 1_500;  // allow Airbnb's next-page render
+      const seenKeys = new Set();  // dedupe by confirmation code
+
+      const captureCurrentPage = async () => {
+        const rows = await page.evaluate(() => {
+          const results = [];
+          const trs = document.querySelectorAll('table tbody tr');
+          for (const r of trs) {
+            const cells = [...r.querySelectorAll('td')];
+            if (cells.length < 4) continue;
+            results.push(cells.map(c => (c.textContent || '').trim()));
+          }
+          return results;
+        }).catch(() => []);
+        return rows;
+      };
+
+      // Scroll the Next button into view (sometimes offscreen on short viewports)
+      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+      await page.waitForTimeout(500);
+
+      // Capture page 1
+      let pageIdx = 1;
+      let pageRows = await captureCurrentPage();
+      accumulated.push({ pageIdx, rows: pageRows });
+
+      for (; pageIdx < MAX_PAGES; pageIdx++) {
+        // Find the next-page button. Airbnb uses aria-label="Next page" or an
+        // SVG inside a button. Fallback: number-match the pageIdx+1 button.
+        const nextIdx = pageIdx + 1;
+        const clicked = await page.evaluate((n) => {
+          // (a) explicit numbered button
+          const btns = [...document.querySelectorAll('button, a')];
+          const numBtn = btns.find(b => (b.textContent || '').trim() === String(n));
+          if (numBtn && !numBtn.disabled && !numBtn.getAttribute('aria-disabled')) {
+            try { numBtn.scrollIntoView({ block: 'end' }); numBtn.click(); return 'number'; } catch {}
+          }
+          // (b) "Next" button by aria-label
+          const nextByAria = btns.find(b => /^next( page)?$/i.test(b.getAttribute('aria-label') || ''));
+          if (nextByAria && !nextByAria.disabled && !nextByAria.getAttribute('aria-disabled')) {
+            try { nextByAria.scrollIntoView({ block: 'end' }); nextByAria.click(); return 'aria'; } catch {}
+          }
+          // (c) chevron-right button near pagination
+          const chevronBtn = btns.find(b => b.querySelector('svg') && /next|forward|chevron.*right/i.test(b.getAttribute('aria-label') || b.getAttribute('title') || ''));
+          if (chevronBtn && !chevronBtn.disabled) {
+            try { chevronBtn.scrollIntoView({ block: 'end' }); chevronBtn.click(); return 'chevron'; } catch {}
+          }
+          return null;
+        }, nextIdx).catch(() => null);
+
+        if (!clicked) {
+          airbnbLog('pagination: no next button, stopping', { lastPage: pageIdx });
+          break;
+        }
+
+        await page.waitForTimeout(PAGE_WAIT_MS);
+        const rows = await captureCurrentPage();
+        if (!rows.length) {
+          airbnbLog('pagination: next page empty, stopping', { attemptedPage: pageIdx + 1 });
+          break;
+        }
+        accumulated.push({ pageIdx: pageIdx + 1, rows });
+        airbnbLog('pagination: captured page', { pageIdx: pageIdx + 1, rowCount: rows.length });
+      }
+
+      // Replace the DOM with concatenated rows so the existing header-walker
+      // can read them. We rebuild a synthetic <table> on page so the next
+      // extraction step just works.
+      await page.evaluate((pagesData) => {
+        const existing = document.querySelector('table');
+        if (!existing) return;
+        const tbody = existing.querySelector('tbody');
+        if (!tbody) return;
+        tbody.innerHTML = '';
+        for (const page of pagesData) {
+          for (const cellTexts of page.rows) {
+            const tr = document.createElement('tr');
+            for (const text of cellTexts) {
+              const td = document.createElement('td');
+              td.textContent = text;
+              tr.appendChild(td);
+            }
+            tbody.appendChild(tr);
+          }
+        }
+      }, accumulated).catch(() => {});
+
+      airbnbLog('pagination complete', {
+        pagesVisited: accumulated.length,
+        totalRowsAccumulated: accumulated.reduce((s, p) => s + p.rows.length, 0),
+      });
+
+      const tableRows = await page.evaluate(() => {
+        const MONTH_RE = /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/i;
+        // Walk header cells to figure out column order (robust against reorderings).
+        const headerCells = [...document.querySelectorAll('table thead th, table thead td, table tr:first-child th')];
+        const headers = headerCells.map(h => (h.textContent || '').trim().toLowerCase());
+        const colOf = (...needles) => {
+          for (const n of needles) {
+            const i = headers.findIndex(h => h.includes(n.toLowerCase()));
+            if (i >= 0) return i;
+          }
+          return -1;
+        };
+        const iStatus  = colOf('status');
+        const iGuest   = colOf('guest');
+        const iCheckin = colOf('check-in', 'check in', 'checkin');
+        const iCheckout = colOf('check-out', 'check out', 'checkout');
+        const iBooked  = colOf('booked');
+        const iListing = colOf('listing');
+        const iCode    = colOf('confirmation', 'reservation');
+        const iPayout  = colOf('payout', 'total');
+        const results = [];
+        const rows = document.querySelectorAll('table tbody tr');
+        for (const row of rows) {
+          const cells = [...row.querySelectorAll('td')];
+          if (cells.length < 4) continue;
+          const txt = (i) => (i >= 0 && cells[i]) ? (cells[i].textContent || '').trim() : '';
+          // Guest cell is multi-line: "Carol Taylor\n2 adults"
+          const guestRaw = txt(iGuest);
+          const guestLines = guestRaw.split(/\n|\r/).map(s => s.trim()).filter(Boolean);
+          const guestName = guestLines[0] || '';
+          const guestsLine = guestLines.slice(1).join(' ');
+          const nAdults = (/(\d+)\s*adult/i.exec(guestsLine) || [,0])[1];
+          const nChildren = (/(\d+)\s*child/i.exec(guestsLine) || [,0])[1];
+          const nInfants = (/(\d+)\s*infant/i.exec(guestsLine) || [,0])[1];
+          const guestCount = Number(nAdults) + Number(nChildren) + Number(nInfants);
+          // Dates: "5 Oct 2026" or "5\nOct 2026"
+          const normDate = (s) => {
+            if (!s) return '';
+            // Keep first chunk that looks like "<day> <month> <year>"
+            const m = /\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})\b/i.exec(s.replace(/\n/g, ' '));
+            return m ? `${m[1]} ${m[2]} ${m[3]}` : s;
+          };
+          results.push({
+            status:   txt(iStatus),
+            guest:    guestName,
+            checkin:  normDate(txt(iCheckin)),
+            checkout: normDate(txt(iCheckout)),
+            booked:   txt(iBooked).split('\n')[0].trim(),
+            listing:  txt(iListing),
+            confirmationCode: txt(iCode),
+            total:    txt(iPayout),
+            guests:   guestCount > 0 ? guestCount : null,
+            adults:   Number(nAdults) || 0,
+            children: Number(nChildren) || 0,
+            infants:  Number(nInfants) || 0,
+          });
+        }
+        return results;
+      }).catch(() => []);
+
+      airbnbLog('upcoming table scraped', { rowCount: tableRows.length });
+
+      if (tableRows.length > 0) {
+        // Normalize into the shape the dashboard expects. Also parse dates
+        // "5 Oct 2026" → "2026-10-05" via LOCAL components (avoids the BST
+        // toISOString shift bug we fixed earlier).
+        const toLocalYmd = (s) => {
+          if (!s) return '';
+          const m = /\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})\b/i.exec(s);
+          if (!m) return s;
+          const months = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 };
+          const d = new Date(Number(m[3]), months[m[2].slice(0,3).toLowerCase()], Number(m[1]));
+          if (isNaN(d)) return s;
+          const y = d.getFullYear();
+          const mm = String(d.getMonth() + 1).padStart(2, '0');
+          const dd = String(d.getDate()).padStart(2, '0');
+          return `${y}-${mm}-${dd}`;
+        };
+        const result = tableRows
+          .filter(r => r.checkin && r.checkout)              // skip malformed rows
+          .filter(r => !/cancel|declin/i.test(r.status || '')) // drop ONLY cancelled/declined
+                                                              // ("expir" would catch "Review guest - Expires soon",
+                                                              //  which is a valid past stay — removed from filter)
+          .map(r => ({
+            confirmationCode: r.confirmationCode || '',
+            guest:    r.guest,
+            checkin:  toLocalYmd(r.checkin),
+            checkout: toLocalYmd(r.checkout),
+            status:   /currently hosting/i.test(r.status) ? 'currently hosting' :
+                      /cancel/i.test(r.status) ? 'cancelled' :
+                      /confirm|accept/i.test(r.status) ? 'confirmed' : (r.status || 'confirmed'),
+            total:    r.total || '',
+            listing:  r.listing || '',
+            guests:   r.guests ?? null,
+            guestBreakdown: Object.fromEntries(
+              [['adults', r.adults], ['children', r.children], ['infants', r.infants]]
+                .filter(([, v]) => v > 0)
+            ),
+          }));
+        airbnbLog('returning reservations from /upcoming table', { count: result.length });
+        airbnbDiagInfo('get_airbnb_reservations');
+        return result;
+      }
+    }
+
+    // Fallback: old /hosting page flow (XHR interception + __NEXT_DATA__ + body-text).
+    airbnbLog('upcoming table empty — falling back to /hosting');
+    await page.goto('https://www.airbnb.com/hosting', { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    assertAirbnbNotLoginPage(page.url());
+
+    // /hosting lands on the "Today" tab by default. That tab shows the current
+    // guest's action status (e.g. "Carol's group of 2 checks in" with time
+    // 15:00) but no date-range line. Capture its body text FIRST so entries
+    // like Carol are preserved — otherwise clicking the Upcoming tab below
+    // wipes the Today content before we can parse it.
+    const todayBodyText = await page.evaluate(() => document.body?.innerText ?? '').catch(() => '');
+    airbnbLog('today-tab body captured', { len: todayBodyText.length });
+
+    // Also inspect the DOM for Today-tab cards — the plain innerText loses the
+    // actual date range, but a card often carries it in an aria-label, title,
+    // or in an anchor href pointing at /hosting/reservations/details/<code>.
+    // Extract what we can and remember it so we can enrich the parsed entries.
+    const todayCardMeta = await page.evaluate(() => {
+      const results = [];
+      const groupPattern = /['’]s\s+group\s+of\s+\d+/i;
+      const monthDay = /(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}/gi;
+      const walkers = [...document.querySelectorAll('[aria-label], [title], a[href*="reservation"]')];
+      // Also look at direct text nodes that match "'s group of N"
+      const groupNodes = [...document.querySelectorAll('*')].filter(el => {
+        const t = (el.textContent || '').trim();
+        return t.length < 80 && groupPattern.test(t);
+      });
+      const seen = new Set();
+      const pushMeta = (el, name) => {
+        if (seen.has(el)) return;
+        seen.add(el);
+        // Climb up to 5 ancestors and collect aria-label / title / href + any
+        // date-looking strings in their text / attributes.
+        const bucket = { name, dates: [], hrefs: [], labels: [] };
+        let node = el;
+        for (let i = 0; i < 5 && node; i++, node = node.parentElement) {
+          const al = node.getAttribute?.('aria-label');
+          const ti = node.getAttribute?.('title');
+          const hr = node.getAttribute?.('href');
+          if (al) bucket.labels.push(al.slice(0, 200));
+          if (ti) bucket.labels.push(ti.slice(0, 200));
+          if (hr) bucket.hrefs.push(hr);
+          const text = (node.textContent || '').slice(0, 400);
+          const matches = text.match(monthDay);
+          if (matches) bucket.dates.push(...matches.slice(0, 4));
+        }
+        results.push(bucket);
+      };
+      for (const el of groupNodes) {
+        const m = (el.textContent || '').match(/^(.+?)['’]s\s+group\s+of\s+(\d+)/i);
+        if (m) pushMeta(el, m[1].trim());
+      }
+      return results.slice(0, 20); // safety cap
+    }).catch(() => []);
+    airbnbLog('today-card DOM meta', { count: todayCardMeta.length, sample: todayCardMeta.slice(0, 2) });
 
     // Wait up to 15s for Upcoming section dates to appear without clicking anything.
     // The section renders asynchronously after initial page load.
@@ -326,7 +606,11 @@ async function _getAirbnbReservations(days = 30) {
     // The Upcoming section renders reservation cards as plain text in a predictable
     // pattern: date-range line → optional "+N" → "N other" → "Guest's group of N".
     // No confirmation codes, but enough for the calendar (checkin/checkout/guests).
-    const bodyText = await page.evaluate(() => document.body?.innerText ?? '');
+    // Combine Today-tab body (captured before Upcoming was clicked) with the
+    // current body (Upcoming). This way the parser sees today's "checks in"
+    // guest AND all the future date-range entries in one pass.
+    const upcomingBodyText = await page.evaluate(() => document.body?.innerText ?? '');
+    const bodyText = todayBodyText + '\n' + upcomingBodyText;
     // Log raw unicode codepoints of first date-like line for debugging
     const firstDateLine = bodyText.split('\n').find(l => /Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec/.test(l));
     airbnbLog('body-text fallback', {
@@ -340,26 +624,41 @@ async function _getAirbnbReservations(days = 30) {
     const DATE_RANGE_RE = new RegExp(
       `^(${MONTH})[\\s ]+(\\d{1,2})[\\s ]*[—–—–-][\\s ]*(?:(${MONTH})[\\s ]+)?(\\d{1,2})$`
     );
-    // Match "Kathy's group of 2" — apostrophe may be curly ’ or straight '
-    const GUEST_RE = /^(.+?)[’']s\s+group\s+of\s+(\d+)$/i;
-    // "Show more" line ends the visible list
-    const STOP_RE = /^show more$/i;
+    // Match "Kathy's group of 2" (upcoming view) OR today-view variants:
+    //   "Carol's group of 2 checks in"
+    //   "Carol's group of 2 checks out"
+    //   "Carol's group of 2 is staying"
+    // Apostrophe may be curly ’ or straight '. Captures: 1=name, 2=count, 3=action (optional).
+    const GUEST_RE = /^(.+?)[’']s\s+group\s+of\s+(\d+)(?:\s+(checks?\s+in|checks?\s+out|is\s+staying))?$/i;
+    // Historically we stopped at "Show more" — but Airbnb now splits reservations
+    // across sections (Currently hosting / Arriving today / Upcoming), each with
+    // its own "Show more" link. Stopping at the first one skipped later sections.
+    // Only halt at the page footer (handled inline below).
+    const STOP_RE = /^$/; // never matches — kept for compat
 
     const lines = bodyText.split('\n').map(l => l.trim()).filter(Boolean);
-    // Find "Upcoming" header then parse until "Show more" or page footer
-    const upcomingIdx = lines.findIndex(l => /^Upcoming$/i.test(l));
-    const slice = upcomingIdx >= 0 ? lines.slice(upcomingIdx + 1) : lines;
+    // Airbnb /hosting splits reservations across several sections. We want all
+    // of them: "Currently hosting", "Checking out", "Arriving soon",
+    // "Upcoming", etc. Find the first known section header and parse to the
+    // end of the reservation area (before the "Show more" sentinel or page
+    // footer). This way the guest arriving TODAY — who's been moved out of
+    // "Upcoming" into "Currently hosting" / "Arriving today" — still appears.
+    const SECTION_RE = /^(Currently hosting|Checking out|Arriving (today|soon)|Upcoming|Awaiting review|Pending)$/i;
+    const firstSectionIdx = lines.findIndex(l => SECTION_RE.test(l));
+    const slice = firstSectionIdx >= 0 ? lines.slice(firstSectionIdx + 1) : lines;
 
     const textReservations = [];
     let pendingDate = null;
     const currentYear = new Date().getFullYear();
-    for (const line of slice) {
+    // Match a currency amount like "£253.15", "$253", "€253.15" (rejects K/M/B suffixes)
+    const PRICE_RE = /([£$€])\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)(?!\s*[KMB]\b)/i;
+    for (let i = 0; i < slice.length; i++) {
+      const line = slice[i];
       if (STOP_RE.test(line)) break;
       if (/^(Site Footer|Support|Help Center)/i.test(line)) break;
 
       const dateM = DATE_RANGE_RE.exec(line);
       if (dateM) {
-        // dateM[1]=startMonth, [2]=startDay, [3]=endMonth(optional), [4]=endDay
         const startMonth = dateM[1];
         const startDay   = dateM[2];
         const endMonth   = dateM[3] ?? startMonth;
@@ -367,16 +666,11 @@ async function _getAirbnbReservations(days = 30) {
         const today = new Date(); today.setHours(0, 0, 0, 0);
         let   ci  = new Date(`${startMonth} ${startDay}, ${currentYear}`);
         let   co  = new Date(`${endMonth} ${endDay}, ${currentYear}`);
-        // All Upcoming reservations are in the future — if checkout < today, bump year.
         if (!isNaN(co) && co < today) {
           ci.setFullYear(ci.getFullYear() + 1);
           co.setFullYear(co.getFullYear() + 1);
         }
-        // Handle cross-month ranges within same slot (e.g. Oct 28 → Nov 1 → checkout before checkin)
         if (!isNaN(ci) && !isNaN(co) && co < ci) co.setFullYear(co.getFullYear() + 1);
-        // Use LOCAL date components — toISOString() converts to UTC which,
-        // for timezones ahead of UTC (like BST/CEST), shifts local midnight
-        // back into the previous calendar day. Bug: "Sep 7" became "2026-09-06".
         const toLocalYmd = (d) => {
           const y = d.getFullYear();
           const m = String(d.getMonth() + 1).padStart(2, '0');
@@ -387,17 +681,101 @@ async function _getAirbnbReservations(days = 30) {
                         checkout: isNaN(co) ? `${endMonth} ${endDay}, ${currentYear}` : toLocalYmd(co) };
         continue;
       }
-      if (!pendingDate) continue;
+      // Try to match guest line even without a pending date — if the match
+      // includes an action suffix ("checks in" / "checks out" / "is staying"),
+      // we synthesize dates from today. These are the Today-view entries where
+      // Airbnb doesn't render a date range.
+      const guestLineM = GUEST_RE.exec(line);
+      if (!pendingDate && !(guestLineM && guestLineM[3])) continue;
 
-      const guestM = GUEST_RE.exec(line);
+      // Reuse the match if we already tested it above; otherwise test now.
+      const guestM = guestLineM;
       if (guestM) {
+        // Synthesize dates from today when the line carried an action suffix.
+        if (!pendingDate && guestM[3]) {
+          const action = guestM[3].toLowerCase();
+          const guestName = guestM[1].trim();
+          const toLocalYmd = (d) => {
+            const y = d.getFullYear();
+            const m = String(d.getMonth() + 1).padStart(2, '0');
+            const dd = String(d.getDate()).padStart(2, '0');
+            return `${y}-${m}-${dd}`;
+          };
+          const today = new Date();
+          today.setHours(0, 0, 0, 0);
+          const currentYearNum = today.getFullYear();
+
+          // First try to pull a real date range from the DOM meta we captured
+          // for this card. The aria-label / title often contains "Oct 5 – Oct 9"
+          // even when the plain innerText doesn't.
+          let realCheckin = null, realCheckout = null;
+          const cardHit = todayCardMeta.find(m => m.name && m.name.toLowerCase() === guestName.toLowerCase());
+          if (cardHit && cardHit.dates && cardHit.dates.length >= 1) {
+            // Deduplicate dates in insertion order
+            const uniq = [...new Set(cardHit.dates)];
+            const parse = (s) => {
+              const d = new Date(`${s}, ${currentYearNum}`);
+              if (isNaN(d)) return null;
+              // If parsed date is far in the past, bump to next year (DST / year wrap)
+              if (d < today && (today - d) > 180 * 86400000) d.setFullYear(currentYearNum + 1);
+              return d;
+            };
+            const parsed = uniq.map(parse).filter(Boolean).sort((a, b) => a - b);
+            if (parsed.length >= 2) {
+              realCheckin  = parsed[0];
+              realCheckout = parsed[parsed.length - 1];
+            } else if (parsed.length === 1) {
+              // Single date — use as checkin for "checks in" action, else checkout
+              if (/checks?\s+in/.test(action)) {
+                realCheckin = parsed[0];
+              } else {
+                realCheckout = parsed[0];
+              }
+            }
+          }
+
+          if (realCheckin && realCheckout) {
+            pendingDate = { checkin: toLocalYmd(realCheckin), checkout: toLocalYmd(realCheckout) };
+          } else if (/checks?\s+in/.test(action)) {
+            const anchor = realCheckin || today;
+            // Known checkin, unknown checkout — placeholder +1 night (best guess)
+            const guess = realCheckout || (() => { const d = new Date(anchor); d.setDate(d.getDate() + 1); return d; })();
+            pendingDate = { checkin: toLocalYmd(anchor), checkout: toLocalYmd(guess), _estimated: true };
+          } else if (/checks?\s+out/.test(action)) {
+            const anchor = realCheckout || today;
+            const guess = realCheckin || (() => { const d = new Date(anchor); d.setDate(d.getDate() - 1); return d; })();
+            pendingDate = { checkin: toLocalYmd(guess), checkout: toLocalYmd(anchor), _estimated: true };
+          } else {
+            const tomorrow = new Date(today); tomorrow.setDate(tomorrow.getDate() + 1);
+            pendingDate = { checkin: toLocalYmd(today), checkout: toLocalYmd(tomorrow), _estimated: true };
+          }
+        }
+        // After the guest line, look forward up to 6 lines for a currency amount.
+        // Airbnb renders the card in an order like:
+        //   Sep 12 – 15
+        //   Kathryn's group of 2
+        //   £253.15
+        // But the price sometimes sits above the guest line, so also peek back 3.
+        let total = '';
+        for (let j = i + 1; j < Math.min(i + 7, slice.length); j++) {
+          if (DATE_RANGE_RE.test(slice[j])) break; // next reservation starts
+          const pm = PRICE_RE.exec(slice[j]);
+          if (pm) { total = pm[1] + pm[2]; break; }
+        }
+        if (!total) {
+          for (let j = i - 1; j >= Math.max(0, i - 3); j--) {
+            if (DATE_RANGE_RE.test(slice[j])) break;
+            const pm = PRICE_RE.exec(slice[j]);
+            if (pm) { total = pm[1] + pm[2]; break; }
+          }
+        }
         textReservations.push({
           confirmationCode: '',
           guest:    guestM[1].trim(),
           checkin:  pendingDate.checkin,
           checkout: pendingDate.checkout,
           status:   'confirmed',
-          total:    '',
+          total,
           listing:  '',
           guests:   parseInt(guestM[2], 10),
           guestBreakdown: {},

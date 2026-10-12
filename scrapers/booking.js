@@ -457,13 +457,14 @@ function today() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
-// One week before today, in YYYY-MM-DD. Used as the default startDate so
-// currently-in-house guests (who checked in a few days ago and haven't checked
-// out yet) still appear — Booking's default arrival-date filter otherwise
-// excludes them the moment their check-in day passes.
+// Default startDate for a scrape — reach back to Jan 1 of the current year
+// so the full YTD is captured (past reservations populate the YTD monthly
+// chart and the calendar's past-month view). The calendar widget now
+// supports both forward AND backward month navigation, so going back ~9
+// months is no longer a problem.
 function oneWeekAgo() {
   const d = new Date();
-  d.setDate(d.getDate() - 7);
+  d.setMonth(0, 1); // Jan 1 of current year
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
@@ -888,6 +889,41 @@ async function applyDateFilterByCalendar(page, input, startDate, endDate) {
     }
   }
 
+  async function clickPrev() {
+    try {
+      const ok = await page.evaluate(() => {
+        const containers = document.querySelectorAll(
+          '[role="dialog"], [class*="popover"], [class*="datepicker"], ' +
+          '[class*="calendar"], [class*="picker"]'
+        );
+        for (const c of containers) {
+          const buttons = c.querySelectorAll('button, [role="button"]');
+          for (const b of buttons) {
+            const label = (b.getAttribute('aria-label') || '').toLowerCase();
+            const text  = (b.textContent || '').trim();
+            const cls   = (b.className || '').toLowerCase();
+            const isNext =
+              label.includes('next') ||
+              text === '›' || text === '>' || text === '→' ||
+              cls.includes('next');
+            const isPrev =
+              label.includes('prev') ||
+              text === '‹' || text === '<' || text === '←' ||
+              cls.includes('prev');
+            if (isPrev && !isNext) {
+              b.click();
+              return true;
+            }
+          }
+        }
+        return false;
+      });
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+
   async function clickDay(dateISO) {
     const day = parseInt(dateISO.split('-')[2], 10);
     try {
@@ -932,10 +968,12 @@ async function applyDateFilterByCalendar(page, input, startDate, endDate) {
     bookingLog('calendar header read', { header: header.text });
     let curIdx = header.year * 12 + header.monthIdx;
     let safety = 0;
-    while (curIdx !== targetIdx && safety++ < 36) {
-      if (curIdx > targetIdx) break;
-      if (!(await clickNext())) {
-        bookingLog('next-month button not found', { curIdx, targetIdx });
+    while (curIdx !== targetIdx && safety++ < 48) {
+      const goBack = curIdx > targetIdx;
+      const stepped = goBack ? await clickPrev() : await clickNext();
+      if (!stepped) {
+        bookingLog(goBack ? 'prev-month button not found' : 'next-month button not found',
+          { curIdx, targetIdx });
         return false;
       }
       await page.waitForTimeout(220);
@@ -980,7 +1018,12 @@ export async function getBookingReservations(args = {}) {
   return _bookingSerialize(() => _autoRefreshOnExpiry(() => _getBookingReservations(args)));
 }
 async function _getBookingReservations({ startDate, endDate, useSearchUrl = false } = {}) {
-  const start = startDate || today();
+  // Default start is ONE WEEK AGO (not today) so currently-in-house guests
+  // — who checked in a few days ago and haven't checked out yet — are still
+  // included in the result. Booking's arrival-date filter would otherwise drop
+  // them the moment their check-in day passes, meaning the dashboard shows
+  // nothing for the guest currently sleeping in the apartment.
+  const start = startDate || oneWeekAgo();
   const end   = endDate   || oneYearFromNow();
   resetDiag();
   bookingLog('getBookingReservations', { start, end, useSearchUrl });
@@ -1337,44 +1380,119 @@ async function _getBookingReservations({ startDate, endDate, useSearchUrl = fals
       '[data-testid="reservation-row"]', '[data-test-id="reservation-row"]',
       '[data-test-id*="reservation-list-item"]', 'main table tbody tr',
     ];
-    const PAGINATE_MAX_MS = 25_000;
+    // Booking's reservations page uses NUMBERED pagination (1 2 3 >), not
+    // infinite scroll. We walk pages one at a time, capturing rows into a
+    // page-accumulator; after the last page we rebuild the DOM table body
+    // with every row concatenated so the existing scrape logic reads them
+    // all at once.
+    const PAGINATE_MAX_MS = 45_000;
     const paginateStart = Date.now();
-    let prevRowCount = -1;
-    let stableIterations = 0;
-    for (let page_i = 0; page_i < 10; page_i++) {
+    const accumulatedPageRows = []; // array of { rows: string[][] } per page
+
+    // Capture rows as [[{text, heading}, ...], ...] — preserving the
+    // data-heading attribute on each cell is essential because the downstream
+    // extractor looks up cells by heading name ("Guest", "Check-in", etc).
+    // Without it the extractor can't tell which column is which.
+    const captureBookingRows = async () => {
+      return await page.evaluate((sels) => {
+        for (const s of sels) {
+          const trs = document.querySelectorAll(s);
+          if (trs.length) {
+            return [...trs].map(tr => {
+              const cells = tr.querySelectorAll('td, [role="cell"]');
+              if (cells.length) {
+                return [...cells].map(c => ({
+                  text: (c.textContent || '').trim(),
+                  heading: c.getAttribute('data-heading') || '',
+                }));
+              }
+              return [{ text: (tr.textContent || '').trim(), heading: '' }];
+            });
+          }
+        }
+        return [];
+      }, ROW_SELS_FOR_COUNT).catch(() => []);
+    };
+
+    // Capture page 1
+    let bookingPageIdx = 1;
+    let page1Rows = await captureBookingRows();
+    accumulatedPageRows.push({ pageIdx: 1, rows: page1Rows });
+    bookingLog('booking pagination: page 1', { rowCount: page1Rows.length });
+
+    const BOOKING_MAX_PAGES = 20;
+    for (; bookingPageIdx < BOOKING_MAX_PAGES; bookingPageIdx++) {
       if (Date.now() - paginateStart > PAGINATE_MAX_MS) {
-        bookingLog('pagination time budget exhausted', { page_i, elapsedMs: Date.now() - paginateStart });
+        bookingLog('booking pagination budget exhausted', { pageIdx: bookingPageIdx });
         break;
       }
-      await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(1_000);
+      const nextPageNum = bookingPageIdx + 1;
+      const clicked = await page.evaluate((n) => {
+        const btns = [...document.querySelectorAll('button, a')];
+        // (a) numbered page button
+        const num = btns.find(b => (b.textContent || '').trim() === String(n));
+        if (num && !num.disabled && !num.getAttribute('aria-disabled')) {
+          try { num.scrollIntoView({ block: 'end' }); num.click(); return 'number'; } catch {}
+        }
+        // (b) aria-label Next page
+        const nextByAria = btns.find(b => /^next( page)?$/i.test(b.getAttribute('aria-label') || ''));
+        if (nextByAria && !nextByAria.disabled && !nextByAria.getAttribute('aria-disabled')) {
+          try { nextByAria.scrollIntoView({ block: 'end' }); nextByAria.click(); return 'aria'; } catch {}
+        }
+        // (c) chevron right in pagination area
+        const chevron = btns.find(b => b.querySelector('svg') && /next|forward|chevron.*right/i.test(b.getAttribute('aria-label') || b.getAttribute('title') || ''));
+        if (chevron && !chevron.disabled) {
+          try { chevron.scrollIntoView({ block: 'end' }); chevron.click(); return 'chevron'; } catch {}
+        }
+        return null;
+      }, nextPageNum).catch(() => null);
 
-      const loadMoreSelectors = [
-        'button:has-text("Show more")', 'button:has-text("Load more")',
-        '[data-test-id*="load-more"]', '[data-test-id*="show-more"]',
-        '[class*="load-more"]', '[class*="pagination"] a[rel="next"]',
-      ];
-      let loadMoreClicked = false;
-      for (const sel of loadMoreSelectors) {
-        const btn = page.locator(sel).first();
-        if (await btn.count() > 0 && await btn.isVisible().catch(() => false)) {
-          try { await btn.click({ timeout: 2_000 }); await page.waitForTimeout(1_500); loadMoreClicked = true; break; } catch {}
+      if (!clicked) {
+        bookingLog('booking pagination: no next page button, stopping', { lastPage: bookingPageIdx });
+        break;
+      }
+      await page.waitForTimeout(1_500);
+      const rows = await captureBookingRows();
+      if (!rows.length) {
+        bookingLog('booking pagination: next page empty', { attemptedPage: bookingPageIdx + 1 });
+        break;
+      }
+      accumulatedPageRows.push({ pageIdx: bookingPageIdx + 1, rows });
+      bookingLog('booking pagination: captured page', { pageIdx: bookingPageIdx + 1, rowCount: rows.length });
+    }
+
+    // Rebuild table body with every page concatenated so the downstream
+    // scrape sees all rows at once. Re-apply data-heading so the extractor
+    // can look cells up by column name.
+    await page.evaluate((pages) => {
+      const table = document.querySelector('table[class*="peg"], main table');
+      if (!table) return;
+      const tbody = table.querySelector('tbody');
+      if (!tbody) return;
+      tbody.innerHTML = '';
+      for (const page of pages) {
+        for (const cells of page.rows) {
+          const tr = document.createElement('tr');
+          for (const cell of cells) {
+            const td = document.createElement('td');
+            if (cell && typeof cell === 'object') {
+              td.textContent = cell.text || '';
+              if (cell.heading) td.setAttribute('data-heading', cell.heading);
+            } else {
+              // backward compat if a page was captured as plain strings
+              td.textContent = String(cell || '');
+            }
+            tr.appendChild(td);
+          }
+          tbody.appendChild(tr);
         }
       }
+    }, accumulatedPageRows).catch(() => {});
 
-      const curCount = await page.evaluate((sels) => {
-        for (const s of sels) { const r = document.querySelectorAll(s); if (r.length) return r.length; }
-        return 0;
-      }, ROW_SELS_FOR_COUNT);
-      bookingLog('pagination step', { page_i, curCount, prevRowCount, loadMoreClicked });
-      if (curCount === prevRowCount && !loadMoreClicked) {
-        stableIterations++;
-        if (stableIterations >= 2) break; // two stable iterations in a row → done
-      } else {
-        stableIterations = 0;
-      }
-      prevRowCount = curCount;
-    }
+    bookingLog('booking pagination complete', {
+      pagesVisited: accumulatedPageRows.length,
+      totalRows: accumulatedPageRows.reduce((s, p) => s + p.rows.length, 0),
+    });
 
     const scrapeResult = await page.evaluate(() => {
       // Try every known row pattern AND record which one matched + how many.
